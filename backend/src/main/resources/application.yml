@@ -1,0 +1,58 @@
+spring:
+  application:
+    name: syncml-server
+
+  # 개발 환경: H2 (로컬 테스트)
+  profiles:
+    active: dev
+
+---
+spring:
+  config:
+    activate:
+      on-profile: dev
+
+  datasource:
+    url: jdbc:h2:mem:syncml_ota;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+# 단말 시뮬레이터 설정 (dev 프로파일에서만 활성화)
+simulator:
+  enabled: true
+  start-delay-ms: 5000  # 서버 시작 후 시뮬레이터 시작까지 대기 시간
+
+---
+spring:
+  config:
+    activate:
+      on-profile: prod
+
+  datasource:
+    url: jdbc:postgresql://postgres:5432/syncml_ota
+    driver-class-name: org.postgresql.Driver
+    username: syncml
+    password: syncml_password
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+
+server:
+  port: 8080
+
