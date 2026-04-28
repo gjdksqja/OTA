@@ -98,8 +98,15 @@ CREATE TABLE device (
     target_version VARCHAR(50),
     last_seen_at TIMESTAMP,
     device_status VARCHAR(20)  -- IDLE, UPDATING, FAILED
+    -- ❌ 미구현: max_msg_size INT       (DevInfo 교환 후 채움)
+    -- ❌ 미구현: max_obj_size INT       (DevInfo 교환 후 채움)
+    -- ❌ 미구현: support_large_obj BOOLEAN  (MoreData 지원 여부)
+    -- ❌ 미구현: manufacturer VARCHAR(50)
+    -- ❌ 미구현: dm_client_version VARCHAR(20)
 );
 ```
+
+> 미구현 컬럼은 [5.0.3 DevInfo 사전 교환](#503-devinfo-사전-교환-표준-정합성) 과 [5.7 MoreData](#57-메시지-사이징--moredata-청킹) 도입 시 추가.
 
 ### 4.2 update_job (작업)
 
@@ -109,11 +116,21 @@ CREATE TABLE update_job (
     target_vin VARCHAR(50) REFERENCES device(vin),
     command_type VARCHAR(50),  -- FUMO_UPDATE, SCOMO_INSTALL 등
     payload_version VARCHAR(50),
+    pkg_url VARCHAR(500),
     status VARCHAR(20),  -- QUEUED, ASSIGNED, DOWNLOADING, INSTALLING, SUCCESS, FAIL
+    retry_count INT DEFAULT 0,
+    error_message TEXT,
     created_at TIMESTAMP,
     updated_at TIMESTAMP
+    -- ❌ 미구현: pkg_size BIGINT             (패키지 byte 크기)
+    -- ❌ 미구현: pkg_sha256 VARCHAR(64)      (SHA-256 hex)
+    -- ❌ 미구현: pkg_signature TEXT          (Base64 코드사이닝 서명)
+    -- ❌ 미구현: signature_algorithm VARCHAR(50)  -- RSA-PSS-SHA256, ECDSA-P256-SHA256
+    -- ❌ 미구현: signing_cert_chain TEXT     (PEM 체인)
 );
 ```
+
+> 미구현 컬럼은 [5.9 PKI 검증 흐름](#59-패키지-무결성--pki-검증-흐름) 도입 시 추가.
 
 ### 4.3 sync_session (세션)
 
@@ -387,6 +404,49 @@ INITIALIZED ──(인증성공)──► AUTHENTICATED ──(작업시작)─�
                               └───────────┘
 ```
 
+### 5.0.3 DevInfo 사전 교환 (표준 정합성)
+
+> ❌ **미구현** — 현재는 `Source LocURI` 에서 VIN만 추출. 표준 SyncML DM은 첫 세션에서 단말 정보 트리 전체를 교환한다.
+
+SyncML 1.2 표준은 첫 세션에서 단말이 자기 정보(`./DevInfo` 트리)를 서버에 전달해야 한다. 이게 있어야 서버가 메시지 사이즈 분할(MoreData), 언어, 모델별 분기를 할 수 있다.
+
+**표준 DevInfo 트리:**
+
+| 노드 | 의미 | 예시 |
+|------|------|------|
+| `./DevInfo/DevId` | 단말 고유 ID | `IMEI:VIN-0001` |
+| `./DevInfo/Man` | 제조사 | `Hyundai` |
+| `./DevInfo/Mod` | 모델명 | `TEST-MODEL-A` |
+| `./DevInfo/DmV` | DM 클라이언트 버전 | `1.2` |
+| `./DevInfo/Lang` | 언어 | `ko-KR` |
+| `./DevInfo/Ext/MaxMsgSize` | 한 번에 받을 수 있는 SyncML 메시지 max byte | `16384` |
+| `./DevInfo/Ext/MaxObjSize` | 한 Item의 max byte | `8192` |
+| `./DevInfo/Ext/SupportLargeObj` | LargeObject(MoreData) 지원 여부 | `true` |
+
+**교환 패턴 (둘 중 하나):**
+
+```
+패턴 A: Client-Push (단말이 먼저 보냄)
+─────────────────────────────────────
+Client → Server: Alert 1201 + Put ./DevInfo + Cred
+Server → Client: Status 212 + (다음 명령)
+
+패턴 B: Server-Pull (서버가 요청)
+─────────────────────────────────────
+Client → Server: Alert 1201 + Cred
+Server → Client: Status 212 + Get ./DevInfo
+Client → Server: Results ./DevInfo
+Server → Client: (다음 명령)
+```
+
+**왜 필요한가:**
+- `MaxMsgSize` 모르면 응답 메시지가 단말 버퍼 초과 → 단말 측에서 무한 재시도
+- `MaxObjSize` 모르면 Replace에 큰 데이터 못 실음
+- `Mod`/`Man` 으로 모델별 펌웨어 다르게 보냄
+- `Lang` 으로 에러 메시지 i18n
+
+---
+
 ### 5.1 FUMO 9단계 상세 흐름
 
 > **핵심**: "Server → Client"는 서버가 클라이언트를 찾아가는 게 아니라,
@@ -408,6 +468,7 @@ INITIALIZED ──(인증성공)──► AUTHENTICATED ──(작업시작)─�
 │                                                                    │
 │  Step 4: 서버 → 차량   "이 URL에서 다운받아" (Replace PkgURL)         │
 │          └─ 작업이 없으면 Status 200 + Final로 즉시 종료              │
+│          └─ ❌ 미구현: PackageSize, PackageHash, PackageSig 동봉 필요  │
 │                                                                    │
 │  Step 5: 차량 → 서버   "다운로드 완료" (Status 200)                   │
 │          └─ 실패 시 Status 500 반환, 서버가 재시도 또는 FAIL 처리      │
@@ -523,6 +584,223 @@ IDLE ──(작업생성)──► QUEUED ──(세션시작)──► ASSIGNED
 | 작업 실패 후 | 30초 | 재시도 대기 |
 | 평상시 (Idle) | 5초 | 새 작업 빠르게 감지 |
 | 업데이트 중 | 즉시 | 다음 명령 받기 위해 |
+
+---
+
+### 5.7 메시지 사이징 & MoreData 청킹
+
+> ❌ **미구현** — 현재 [SyncMLXmlUtil](../backend/src/main/java/com/syncml/server/syncml/util/SyncMLXmlUtil.java) 은 한 HTTP 요청 = 한 SyncML 메시지로 가정. `<MoreData/>` 처리 없음.
+
+**왜 필요한가:**
+- 단말 메모리 버퍼는 보통 8~32KB. DevInfo Result, 다중 ECU 진단, 대용량 Replace 는 한 메시지에 못 담음.
+- 표준 단말은 `MaxMsgSize` 초과 메시지를 받으면 Status 413/500 반환 → 작업 진행 불가.
+
+**MoreData 동작 방식:**
+
+```
+[큰 데이터를 여러 메시지로 분할 전송]
+─────────────────────────────────────
+Msg N:
+  <Replace>
+    <CmdID>5</CmdID>
+    <Item>
+      <Target><LocURI>./FUMO/Description</LocURI></Target>
+      <Data>(첫 8KB)</Data>
+      <MoreData/>          ← "이 Item 아직 더 있음"
+    </Item>
+  </Replace>
+
+Msg N+1:
+  <Replace>
+    <CmdID>5</CmdID>      ← 같은 CmdID로 이어붙임
+    <Item>
+      <Target><LocURI>./FUMO/Description</LocURI></Target>
+      <Data>(나머지 4KB)</Data>
+                           ← MoreData 없음 = 끝
+    </Item>
+  </Replace>
+```
+
+**구현 시 필요한 것:**
+
+| 항목 | 위치 |
+|------|------|
+| `Command.Item`, `Result.Item` 에 `boolean moreData` 필드 | [DTO](../backend/src/main/java/com/syncml/server/syncml/dto/) |
+| `<MoreData/>` 파싱/생성 | [SyncMLXmlUtil](../backend/src/main/java/com/syncml/server/syncml/util/SyncMLXmlUtil.java) |
+| 세션 단위 reassembly buffer | [SyncSession](../backend/src/main/java/com/syncml/server/domain/SyncSession.java) |
+| 응답 직렬화 직전 byte 측정 → 분할 | [SyncMLMessageService](../backend/src/main/java/com/syncml/server/syncml/service/SyncMLMessageService.java) |
+
+---
+
+### 5.8 WBXML 인코딩 (운영 환경)
+
+> ❌ **미구현** — 현재 XML 텍스트만 지원. Content-Type `application/vnd.syncml.dm+xml` 만 처리.
+
+**왜 필요한가:**
+- 차량 OTA는 셀룰러 망. WBXML은 같은 SyncML 메시지를 **4~10배 압축** (태그를 1바이트 토큰으로 치환).
+- 양산 차량 ECU의 표준은 WBXML. XML은 개발/디버깅용. Content-Type `application/vnd.syncml+wbxml`.
+
+**XML vs WBXML 크기 비교:**
+
+```
+XML (현재):
+<SyncML xmlns="SYNCML:SYNCML1.2">
+  <SyncHdr>
+    <VerDTD>1.2</VerDTD>
+    <SessionID>abc</SessionID>
+    <MsgID>1</MsgID>
+  </SyncHdr>
+  ...
+</SyncML>
+→ 약 500 bytes
+
+WBXML (목표):
+0x02 0x9F 0x53 0x00 0x4D 0x4C 0x01 ...
+→ 약 80~120 bytes (5배 압축)
+```
+
+**구현 옵션:**
+
+| 방법 | 장단점 |
+|------|--------|
+| `libwbxml` Java 바인딩 | 검증됨, 의존성 추가 |
+| `kxml2-wbxml` | 안드로이드 계열, 가벼움 |
+| 직접 구현 (SyncML 1.2 코드페이지 0~6) | 학습 가치 큼, 시간 소요 |
+
+**구현 시 필요한 것:**
+
+| 항목 | 위치 |
+|------|------|
+| WBXML 인코더/디코더 | 신규 `WbxmlCodec.java` |
+| Content-Type 협상 | [SyncMLController](../backend/src/main/java/com/syncml/server/syncml/controller/SyncMLController.java) |
+| 토큰 테이블 (DM 1.2 codepage) | 신규 리소스 |
+| Pluggable serializer 인터페이스 | 기존 XmlUtil 추상화 |
+
+---
+
+### 5.9 패키지 무결성 & PKI 검증 흐름
+
+> ❌ **미구현** — 현재 [UpdateJob](../backend/src/main/java/com/syncml/server/domain/UpdateJob.java) 은 `pkgUrl` 만 보유. 사이즈/해시/서명 컬럼 없음.
+
+**역할 분리 (중요):**
+
+```
+[빌드/릴리스 파이프라인]              [백엔드 OTA 서버]                [차량 단말]
+   ├─ 펌웨어 빌드                       │                              │
+   ├─ HSM/서명서버에서                   │                              │
+   │  코드사이닝 (빌드키)                │                              │
+   ├─ 패키지+서명+메타 업로드 ────────► │                              │
+   │                                  ├─ 업로드 시 1회 검증            │
+   │                                  │  (서명/체인/OCSP)              │
+   │                                  ├─ DB에 sha256+서명 보관          │
+   │                                  ├─ SyncML 응답에 metadata 동봉 ─►│
+   │                                  │                              ├─ 다운로드
+   │                                  │                              ├─ sha256 검증
+   │                                  │                              ├─ 서명 검증 (TA 공개키)
+   │                                  │                              └─ 검증 OK 후 설치
+```
+
+**왜 백엔드가 직접 서명하면 안 되나:**
+- 서버 침해 시 서명키 유출 = 모든 차량에 악성 펌웨어 푸시 (공급망 공격).
+- 서명키는 빌드 환경의 HSM 안에서만 사용. 백엔드는 공개키만 보유.
+- 단말이 신뢰하는 건 백엔드가 아니라 펌웨어에 박힌 **Trust Anchor 공개키**.
+
+**SyncML 표준 트리 (FUMO):**
+
+| 노드 | 의미 | 미구현 여부 |
+|------|------|-------------|
+| `./FUMO/PkgURL` | 패키지 URL | ✅ 구현됨 |
+| `./FUMO/PackageSize` | 패키지 byte 크기 | ❌ |
+| `./FUMO/PackageHash` | SHA-256 (Base64) | ❌ |
+| `./FUMO/PackageSig` | 코드사이닝 서명 (Base64) | ❌ |
+| `./FUMO/SigAlg` | 서명 알고리즘 (`RSA-PSS-SHA256`, `ECDSA-P256`) | ❌ |
+
+**필요한 것:**
+
+| 항목 | 위치 |
+|------|------|
+| `pkgSize`, `pkgSha256`, `pkgSignature`, `signatureAlgorithm` 컬럼 | [UpdateJob](../backend/src/main/java/com/syncml/server/domain/UpdateJob.java) |
+| 패키지 업로드 API + 서명 검증 | 신규 `PackageController` |
+| Replace 명령에 메타 동봉 | [SyncMLMessageService](../backend/src/main/java/com/syncml/server/syncml/service/SyncMLMessageService.java) `determineNextCommands case 3` |
+| 인증서 체인 / OCSP 클라이언트 | 신규 `PkiService` |
+
+> mTLS + 디바이스 인증서 패턴은 [OPERATIONAL_PATTERNS.md](./OPERATIONAL_PATTERNS.md) 참조.
+
+---
+
+### 5.10 Status 코드 의미 분리 (200 / 202 / 212)
+
+> 🟡 **부분 구현** — 200, 212, 401, 500 사용 중. **202 미사용** ([SyncMLMessageService.java](../backend/src/main/java/com/syncml/server/syncml/service/SyncMLMessageService.java)).
+
+**현재 코드의 문제:**
+- 다운로드/설치 진행률 보고도 200, 최종 완료도 200 → 의미가 깨짐.
+- 단말이 "받았고 처리 시작했어" 와 "받았고 끝났어" 를 같은 코드로 보고할 수밖에 없음.
+
+**올바른 의미 분리:**
+
+| 코드 | 의미 | 사용 시점 |
+|------|------|-----------|
+| `200 OK` | 처리 완료 | 최종 완료 (다운로드 끝, 설치 끝) |
+| `202 Accepted` | 받았고 처리 중 | 진행률 보고, 비동기 처리 시작 |
+| `212 Authentication accepted` | 인증 성공 | 세션 인증 성공 시 |
+| `213 Chunked item accepted` | MoreData 청크 받음 | MoreData 분할 수신 시 |
+| `401 Unauthorized` | 인증 필요/실패 | Cred 없거나 틀림 |
+| `500 Command failed` | 처리 실패 | 다운로드/설치 실패 |
+
+**필요한 것:**
+
+| 항목 | 위치 |
+|------|------|
+| 진행률 페이로드 분리 (`DOWNLOAD_IN_PROGRESS` 추가) | [JobStatus](../backend/src/main/java/com/syncml/server/domain/JobStatus.java) |
+| `handleClientStatus` 에 202 분기 추가 → step advance 안 함, 진행률만 갱신 | [SyncMLMessageService](../backend/src/main/java/com/syncml/server/syncml/service/SyncMLMessageService.java) |
+
+---
+
+### 5.11 Generic Alert (1226) 처리
+
+> ❌ **미구현** — [SyncMLMessageService.handleAlert](../backend/src/main/java/com/syncml/server/syncml/service/SyncMLMessageService.java) 는 1201 (Client-Initiated) 만 분기.
+
+**Alert 코드 종류:**
+
+| 코드 | 의미 | 누가 보냄 |
+|------|------|-----------|
+| `1200` | Server-Initiated Session | 서버 → 단말 |
+| `1201` | Client-Initiated Session | 단말 → 서버 (✅ 구현됨) |
+| `1222` | Session Abort | 양쪽 |
+| `1223` | Session Resume | 단말 → 서버 (Resume 정책 시) |
+| `1224` | Next Message | 양쪽 (다음 메시지 있음) |
+| `1225` | No End of Data | MoreData 종료 알림 |
+| `1226` | Generic Alert | 단말 → 서버 (비정형 이벤트) |
+
+**Generic Alert 1226 의 용도:**
+- 단말 측 비정형 이벤트 보고: 배터리 부족, 네트워크 변경, 설치 보류, 진행률, 사용자 거부, PKI 검증 실패 등
+- WBXML/MoreData/PKI 도입 시 단말이 에러를 리포팅할 채널이 됨
+
+**예시 (단말 → 서버):**
+
+```xml
+<Alert>
+  <CmdID>2</CmdID>
+  <Data>1226</Data>
+  <Item>
+    <Meta>
+      <Type xmlns="syncml:metinf">org.openmobilealliance.dm.firmwareupdate.userinteraction</Type>
+      <Format>chr</Format>
+      <Mark>indeterminate</Mark>
+    </Meta>
+    <Source><LocURI>./FUMO/State</LocURI></Source>
+    <Data>SIGNATURE_VERIFY_FAILED</Data>
+  </Item>
+</Alert>
+```
+
+**필요한 것:**
+
+| 항목 | 위치 |
+|------|------|
+| Alert 1226 핸들러 추가 | [SyncMLMessageService.handleAlert](../backend/src/main/java/com/syncml/server/syncml/service/SyncMLMessageService.java) |
+| Alert Type별 라우팅 (battery / progress / pki / userdefer) | 신규 `GenericAlertHandler` |
+| `event_log` 에 Alert 종류별 분류 저장 | [EventLog](../backend/src/main/java/com/syncml/server/domain/EventLog.java) |
 
 ---
 
@@ -1175,11 +1453,14 @@ private static final int SESSION_TIMEOUT_MINUTES = 5;
 | 2026-03-31 | 실무 통신 방식 비교 (SyncML vs MQTT+JSON, RabbitMQ 역할) 추가 |
 | 2026-03-31 | Phase 1 단말 시뮬레이터 구현, RabbitMQ vs MQTT 본질 동일성 정리 |
 | 2026-03-31 | 로그 분리 설정, TODO 문서 작성 |
+| 2026-04-27 | 표준 정합성 갭 분석 추가: 5.0.3 DevInfo 사전 교환, 5.7 MoreData, 5.8 WBXML, 5.9 PKI 패키지 검증, 5.10 Status 코드 의미 분리, 5.11 Generic Alert 1226 (모두 ❌ 미구현 표시) |
+| 2026-04-27 | 데이터 모델(4.1, 4.2)에 미구현 컬럼 명시 |
 
 ---
 
 **관련 문서:**
 - [MESSAGING_COMPARISON.md](./MESSAGING_COMPARISON.md) - MQTT/RabbitMQ/Kafka 비교
+- [OPERATIONAL_PATTERNS.md](./OPERATIONAL_PATTERNS.md) - 알아두면 좋은 운영 패턴 (이 프로젝트 범위 외)
 - [TODO.md](./TODO.md) - 다음 작업 계획
 
 ---

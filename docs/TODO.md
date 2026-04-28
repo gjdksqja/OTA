@@ -1,5 +1,81 @@
 # 작업 일지 및 TODO
 
+---
+
+## 🔴 우선순위 표준 준수 (SyncML 1.2 정합성)
+
+> 2026-04-27 갭 분석 추가. 모두 **아직 작업 안됨**. 위에서부터 순서대로 작업 권장 (의존 관계 있음).
+> 상세 설명은 [ARCHITECTURE.md 섹션 5.0.3 ~ 5.11](./ARCHITECTURE.md#503-devinfo-사전-교환-표준-정합성) 참조.
+
+| # | 항목 | 의존 관계 | 상태 |
+|---|------|-----------|------|
+| 1 | **DevInfo 사전 교환** (`./DevInfo` 트리 표준 교환) | (없음) | 🔴 아직 작업 안됨 |
+| 2 | **파일 사이징 + 패키지 메타** (Device.maxMsgSize, UpdateJob.pkgSize/sha256) | #1 | 🔴 아직 작업 안됨 |
+| 3 | **MoreData 청킹** (`<MoreData/>` 파싱·생성·reassembly) | #1, #2 | 🔴 아직 작업 안됨 |
+| 4 | **PKI 패키지 검증 흐름** (Replace에 Hash/Sig 동봉, 업로드 시 검증) | #2 | 🔴 아직 작업 안됨 |
+| 5 | **Status 202 분리** + **Generic Alert 1226 핸들러** | (없음, 단독 가능) | 🔴 아직 작업 안됨 |
+| 6 | **RabbitMQ Phase 2 연동** (기존 TODO #6) | (없음) | 🟡 계획됨 |
+| 7 | **WBXML 인코딩** (Content-Type 협상, codec 추가) | (없음, 큰 작업) | 🔴 아직 작업 안됨 |
+
+### 작업 순서 권장
+
+```
+[1] DevInfo 사전 교환 ──────► [2] 파일 사이징/패키지 메타 ──┬─► [3] MoreData 청킹
+                                                          │
+                                                          └─► [4] PKI 패키지 검증
+
+[5] Status 202 + Alert 1226   (위 흐름과 독립적, 언제든 가능)
+[6] RabbitMQ Phase 2          (위 흐름과 독립적)
+[7] WBXML                     (큰 작업, 1~4 끝나고)
+```
+
+### 각 항목 상세
+
+#### 1. DevInfo 사전 교환 🔴 아직 작업 안됨
+- **파일**: `SyncMLMessageService.handleMessage`, `SyncMLXmlUtil.parseSyncBody`, `Device` 엔티티
+- **컬럼 추가**: `device.max_msg_size`, `max_obj_size`, `support_large_obj`, `manufacturer`, `dm_client_version`
+- **로직**: 인증 성공 직후 첫 응답에서 `Get ./DevInfo` 발행 → Results 받으면 Device 갱신
+- **참조**: [ARCHITECTURE.md 5.0.3](./ARCHITECTURE.md#503-devinfo-사전-교환-표준-정합성)
+
+#### 2. 파일 사이징 + 패키지 메타 🔴 아직 작업 안됨
+- **파일**: `UpdateJob` 엔티티, 패키지 업로드 API (신규)
+- **컬럼 추가**: `update_job.pkg_size`, `pkg_sha256`, `pkg_signature`, `signature_algorithm`, `signing_cert_chain`
+- **로직**: 패키지 업로드 시 sha256 계산, 사이즈 측정, 메타 저장
+- **참조**: [ARCHITECTURE.md 5.7, 5.9](./ARCHITECTURE.md#57-메시지-사이징--moredata-청킹)
+
+#### 3. MoreData 청킹 🔴 아직 작업 안됨
+- **파일**: `Command.Item`, `Result.Item` DTO + `SyncMLXmlUtil` + `SyncMLMessageService` + `SyncSession`
+- **DTO 변경**: `boolean moreData` 필드 추가
+- **로직**: 응답 직렬화 직전 byte 측정 → device.maxMsgSize 초과 시 Item 분할 + `<MoreData/>` 부착. 수신 시 같은 CmdID로 reassembly buffer에 누적.
+- **참조**: [ARCHITECTURE.md 5.7](./ARCHITECTURE.md#57-메시지-사이징--moredata-청킹)
+
+#### 4. PKI 패키지 검증 흐름 🔴 아직 작업 안됨
+- **파일**: `SyncMLMessageService.determineNextCommands case 3`, 신규 `PackageController`, 신규 `PkiService`
+- **로직**:
+  - 업로드 시: 인증서 체인 검증 + 서명 검증 (실패 거부)
+  - SyncML 응답 시: `Replace ./FUMO/PkgURL` 옆에 `./FUMO/PackageHash`, `./FUMO/PackageSig`, `./FUMO/SigAlg` 같이 발행
+  - 단말이 다운로드 후 sha256 비교 + 서명 검증 → 실패 시 Alert 1226 으로 보고
+- **참조**: [ARCHITECTURE.md 5.9](./ARCHITECTURE.md#59-패키지-무결성--pki-검증-흐름)
+
+#### 5. Status 202 분리 + Generic Alert 1226 🔴 아직 작업 안됨
+- **파일**: `SyncMLMessageService.handleClientStatus`, `handleAlert`, `JobStatus` enum
+- **로직**:
+  - 200 vs 202 분리: 진행률 보고는 202, 최종 완료만 200
+  - Alert 1226 핸들러: Type별 라우팅 (battery / progress / pki_failed / userdefer)
+  - `JobStatus` 에 `DOWNLOAD_IN_PROGRESS`, `INSTALL_IN_PROGRESS` 추가
+- **참조**: [ARCHITECTURE.md 5.10, 5.11](./ARCHITECTURE.md#510-status-코드-의미-분리-200--202--212)
+
+#### 6. RabbitMQ Phase 2 연동 🟡 (기존 계획)
+- 아래 "다음 작업 TODO" 의 #6 참조
+
+#### 7. WBXML 인코딩 🔴 아직 작업 안됨 (큰 작업)
+- **신규 파일**: `WbxmlCodec.java`, DM 1.2 코드페이지 리소스
+- **변경**: `SyncMLController` 에 Content-Type 협상 (`application/vnd.syncml+wbxml` vs `+xml`)
+- **추상화**: 기존 `SyncMLXmlUtil` 을 인터페이스로 분리 → XML/WBXML 둘 다 구현체로
+- **참조**: [ARCHITECTURE.md 5.8](./ARCHITECTURE.md#58-wbxml-인코딩-운영-환경)
+
+---
+
 ## 2026-03-31 작업 완료 내용
 
 ### 1. SyncML 핵심 기능 구현

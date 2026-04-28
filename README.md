@@ -66,6 +66,10 @@ docker-compose up -d
 
 - [x] Phase 1: 아키텍처 문서화
 - [x] Phase 2: Java 백엔드 + DB 큐 (구조 완성, Java 설치 후 빌드 필요)
+- [ ] **Phase 2.5: SyncML 표준 정합성 갭 메우기** 🔴 진행 예정
+  - DevInfo 사전 교환, 파일 사이징, MoreData 청킹, PKI 패키지 검증
+  - Status 202 분리, Generic Alert 1226, WBXML 인코딩
+  - 상세: [TODO.md 표준 준수 우선순위](./docs/TODO.md#-우선순위-표준-준수-syncml-12-정합성)
 - [ ] Phase 3: Vue 3 대시보드
 - [ ] Phase 4: RabbitMQ 확장
 - [ ] Phase 5: Django 운영 도구
@@ -73,5 +77,12 @@ docker-compose up -d
 
 ## 상세 문서
 
-👉 [ARCHITECTURE.md](./docs/ARCHITECTURE.md) 참조
+| 문서 | 내용 |
+|------|------|
+| [ARCHITECTURE.md](./docs/ARCHITECTURE.md) | 전체 아키텍처 (구현 범위 + 표준 정합성 갭 표시) |
+| [TODO.md](./docs/TODO.md) | 작업 일지 + 표준 준수 우선순위 |
+| [MESSAGING_COMPARISON.md](./docs/MESSAGING_COMPARISON.md) | SyncML / MQTT / RabbitMQ / Kafka 본질 비교 |
+| [OPERATIONAL_PATTERNS.md](./docs/OPERATIONAL_PATTERNS.md) | 알아두면 좋은 운영 패턴 (이 프로젝트 범위 외) |
+| [VSCode_Java_Setup_Guide.md](./docs/VSCode_Java_Setup_Guide.md) | VS Code Java 개발 환경 셋팅 |
+| [AI_COLLABORATION.md](./docs/AI_COLLABORATION.md) | AI(Claude Code) 활용 방침·지식 계층 설계·검토 이력 |
 
