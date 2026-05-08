@@ -39,6 +39,10 @@ CREATE TABLE sync_session (
 );
 
 -- 이벤트 로그 테이블
+-- ※ 파티셔닝 검토 (2026-04-30): event_log 가 도메인 내 최대 누적 테이블이지만
+--    1년 누적 1억 건 미만 추정으로 일반 인덱스로 충분. 도입 트리거 충족 시
+--    PARTITION BY RANGE (created_at) 월별 파티션 적용 가능.
+--    상세: docs/OPERATIONAL_PATTERNS.md §6 (Telemetry 확장 및 파티셔닝)
 CREATE TABLE event_log (
     id SERIAL PRIMARY KEY,
     vin VARCHAR(50),

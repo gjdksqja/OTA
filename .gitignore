@@ -51,3 +51,7 @@ Thumbs.db
 node_modules/
 dist/
 
+### Claude Code ###
+# 개인/머신별 로컬 설정 (절대 경로·머신 고유 권한 등)
+.claude/settings.local.json
+

@@ -219,7 +219,145 @@ CREATE TABLE campaign_wave (
 
 ---
 
-## 6. 면접 답변 템플릿
+## 6. Telemetry 확장 시 파티셔닝 / 아카이빙 (현재 OTA에는 불필요)
+
+### 6.1 왜 현재 OTA 프로젝트에 안 넣었나
+
+- OTA 도메인 데이터 (`Device`, `SyncSession`, `UpdateJob`, `SyncMessage`) 누적량은 차량 1만 대 가정 시 1년에 **1억 건 미만**.
+- 일반 PostgreSQL 인덱스로 충분. 파티션 도입 시 운영 복잡도(파티션 생성·머지·제약·통계 동기화)가 더 큼.
+- "있으면 좋다"가 아니라 **"데이터 규모가 부르면 도입한다"**가 정답. 도입 트리거는 §6.7 참조.
+
+### 6.2 Telemetry 확장 시나리오 (가정)
+
+OTA 위에 차량 운행 데이터 수집(속도/RPM/위치/CAN 등)을 얹는 경우.
+
+| 항목 | 추정 |
+|------|------|
+| 차량 수 | 10,000 |
+| 패킷 주기 | 1 Hz (초당 1건) |
+| 1일 누적 | 10K × 86,400 = **약 8.6억 건** |
+| 1년 누적 | **3,000억 건+** |
+| 1건 평균 크기 | 200~500 byte |
+| 1년 raw 데이터 | **60~150 TB** |
+
+→ 단일 테이블로는 인덱스 빌드·통계 갱신·VACUUM이 모두 깨짐. **파티셔닝 + 콜드 스토리지 archive 필수.**
+
+### 6.3 표준 아키텍처 (Telemetry + OTA 공존)
+
+```
+[차량 TCU] ──MQTT──► [MQTT Broker]  ──bridge──► [Kafka]  ──consumer──► [TimescaleDB / Partition PG]
+   │                  (Mosquitto/                (재처리·다중                │
+   │                   EMQX/HiveMQ)              컨슈머·고처리율)             ├─► hot  (SSD, 인덱스 풀)
+   │                                                                         ├─► warm (압축, 인덱스 축소)
+   │                                                                         └─► cold (S3 Parquet, Athena 쿼리)
+   │
+   └── HTTPS POST /syncml ──► [SyncML Backend] ──► [RabbitMQ] ──► [OTA 워커]
+       (OTA 양방향 신뢰성)
+```
+
+**채널·큐 역할 분리**:
+
+| 채널/큐 | 용도 | 특성 |
+|---------|------|------|
+| **MQTT** | 차량 ↔ 클라우드 게이트웨이 | 저전력, 지속 연결, push |
+| **Kafka** | Telemetry 본류 (수집·재처리) | 보존·다중 컨슈머·고처리량 |
+| **RabbitMQ** | OTA 작업 분배 (백엔드 내부) | 작업 큐 정합 |
+| **SyncML/HTTPS** | OTA 본 명령 교환 | 큰 페이로드·신뢰성 |
+
+> **요지**: Telemetry는 Kafka가 사실상 표준. RabbitMQ로도 받을 수 있지만 보존/replay/다중 컨슈머에서 Kafka 우위. 우리 OTA의 RabbitMQ 사용은 "작업 분배" 자리라 정합.
+
+### 6.4 파티션 전략
+
+#### 시간 기반 (일/월) — 가장 일반적
+
+```sql
+CREATE TABLE telemetry (
+    vin         VARCHAR(17)  NOT NULL,
+    sampled_at  TIMESTAMPTZ  NOT NULL,
+    speed_kmh   REAL,
+    rpm         INT,
+    -- ...
+    PRIMARY KEY (vin, sampled_at)
+) PARTITION BY RANGE (sampled_at);
+
+CREATE TABLE telemetry_2026_01 PARTITION OF telemetry
+    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+-- pg_partman 으로 월 단위 자동 생성 권장
+```
+
+- 장점: 시간 범위 쿼리 효율 / 오래된 파티션 통째로 detach·archive·drop 용이.
+- 단점: 단일 차량 전체 이력 쿼리는 모든 파티션 스캔.
+
+#### 시간 + VIN 해시 (초대규모)
+
+```sql
+CREATE TABLE telemetry_2026_01 PARTITION OF telemetry
+    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')
+    PARTITION BY HASH (vin);
+
+CREATE TABLE telemetry_2026_01_h0 PARTITION OF telemetry_2026_01
+    FOR VALUES WITH (modulus 16, remainder 0);
+-- h0 ~ h15
+```
+
+- 장점: 시간+VIN 양쪽 쿼리 모두 효율.
+- 단점: 파티션 수 폭발 (월 × 해시 × 연 → 수백 개).
+
+#### TimescaleDB (PostgreSQL 확장) — 시계열이라면 1순위
+
+- `SELECT create_hypertable('telemetry', 'sampled_at')` 한 줄로 자동 파티션.
+- 컬럼 단위 압축 / retention 정책 / continuous aggregate 내장.
+- **시계열이면 원시 PostgreSQL 파티션보다 TimescaleDB가 정답.**
+
+### 6.5 아카이빙 전략 (Hot / Warm / Cold)
+
+```
+[수집] ──► [Hot: 최근 7일]      ─7일 후→ [Warm: 90일]        ─90일 후→ [Cold: S3]
+            SSD, 인덱스 풀                  HDD, 압축, 인덱스 축소         Parquet
+            대시보드 응답 50ms              분석 응답 500ms                Athena/Trino 쿼리
+            (실시간 대시보드)               (운영 분석/리포트)             (법적 보존·감사)
+```
+
+**자동화 예시**:
+1. 매일 자정: 7일 전 파티션 detach → warm 테이블스페이스로 attach + 압축 적용
+2. 매일 자정: 90일 전 파티션 → `COPY ... TO PROGRAM 'aws s3 cp ... -'` 후 drop
+3. 검색: hot/warm은 PostgreSQL, cold는 Athena/Trino로 별도 경로
+
+### 6.6 현재 OTA에서 "당장" 적용 가능한 부분
+
+**굳이 미리 넣는다면** 가장 큰 로그 테이블 (`SyncMessage`)에만 월별 파티션을 적용해두는 게 가장 ROI 높음.
+
+```sql
+-- 가상의 적용 예 (현재는 미적용)
+CREATE TABLE sync_message (
+    message_id   BIGSERIAL,
+    session_id   BIGINT,
+    direction    VARCHAR(8),       -- IN / OUT
+    received_at  TIMESTAMPTZ NOT NULL,
+    payload      TEXT,
+    PRIMARY KEY (received_at, message_id)
+) PARTITION BY RANGE (received_at);
+```
+
+- 1년 후 월 단위 archive/drop이 한 줄.
+- **하지만 1억 건 미만 단계에서는 일반 인덱스로 충분 — 도입 시점은 "운영 1년 누적 후 측정해서 결정"이 원칙**.
+- 결정 보류 사유는 `db/init.sql`에 주석으로만 표시 (구현체에는 없음).
+
+### 6.7 도입 트리거
+
+다음 중 **2개 이상** 해당 시 파티셔닝 도입 검토:
+
+1. 단일 테이블 누적 **1억 건 초과**
+2. 인덱스 빌드/재구성 **30분 이상**
+3. retention(오래된 데이터 삭제)이 일상 운영 부담
+4. 시간 범위 쿼리가 주요 액세스 패턴
+5. Telemetry 등 **고주파 적재 도메인 추가**
+
+> 트리거가 발동하기 전에는 파티션 도입 자체가 비용. 이 문서의 §6.4~6.5는 "필요해진 순간 즉시 적용 가능한 레퍼런스"로만 보존.
+
+---
+
+## 7. 면접 답변 템플릿
 
 **Q: "왜 MQTT 안 썼어요? 자동차는 보통 MQTT 쓰지 않나요?"**
 
@@ -243,11 +381,21 @@ CREATE TABLE campaign_wave (
 
 ---
 
-## 7. 문서 이력
+**Q: "차량 패킷(텔레메트리) 같은 대용량 시계열 데이터는 어떻게 처리할 건가요?"**
+
+> 현재 OTA 도메인은 1년 누적이 1억 건 미만이라 일반 인덱스만으로 충분해 파티셔닝을 도입하지 않았습니다.
+> 단, 텔레메트리(차량당 1Hz 패킷)까지 확장하면 1일 8억 건 이상이라 시간 기반 파티션 + Hot/Warm/Cold 아카이빙이 필수가 됩니다.
+> 큐 측면에서도 OTA는 작업 분배라 RabbitMQ가 정합하지만, 텔레메트리는 보존·재처리·다중 컨슈머 요구로 Kafka가 표준입니다.
+> 도입 트리거(테이블 1억 건 초과, 인덱스 빌드 30분 초과 등)와 표준 파티션 DDL 예시는 [OPERATIONAL_PATTERNS.md §6](./OPERATIONAL_PATTERNS.md#6-telemetry-확장-시-파티셔닝--아카이빙-현재-ota에는-불필요) 에 정리해뒀습니다.
+
+---
+
+## 8. 문서 이력
 
 | 날짜 | 내용 |
 |------|------|
 | 2026-04-27 | 초안 작성 — MQTT 게이트웨이, Campaign 롤아웃, Resume, 동시 세션, mTLS 패턴 정리 |
+| 2026-04-30 | §6 Telemetry 확장 시 파티셔닝/아카이빙 추가. OTA 본 도메인엔 불필요하나 확장 시 표준 패턴(파티션 전략 3종, Hot/Warm/Cold archive, 도입 트리거) 정리. §7 면접 답변에 텔레메트리 Q&A 추가. |
 
 ---
 
