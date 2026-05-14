@@ -51,6 +51,9 @@ public class Command {
         private String format;
         private String type;
         private String data;
+        /** SyncML <MoreData/> - 이 Item이 다음 메시지/Item으로 이어진다는 표시 */
+        @Builder.Default
+        private boolean moreData = false;
     }
 }
 

@@ -1,9 +1,12 @@
 package com.syncml.server.syncml.service;
 
 import com.syncml.server.domain.*;
+import com.syncml.server.repository.DeviceRepository;
 import com.syncml.server.repository.UpdateJobRepository;
 import com.syncml.server.service.DeviceService;
 import com.syncml.server.service.EventLogService;
+import com.syncml.server.syncml.constant.DevInfoNode;
+import com.syncml.server.syncml.constant.SyncMLLocUri;
 import com.syncml.server.syncml.dto.*;
 import com.syncml.server.syncml.util.SyncMLXmlUtil;
 import lombok.RequiredArgsConstructor;
@@ -32,7 +35,10 @@ public class SyncMLMessageService {
     private final SyncMLSessionService sessionService;
     private final SyncMLAuthService authService;
     private final SyncMLXmlUtil xmlUtil;
+    private final MessageChunker messageChunker;
+    private final ChunkReassemblyService chunkReassemblyService;
     private final DeviceService deviceService;
+    private final DeviceRepository deviceRepository;
     private final UpdateJobRepository jobRepository;
     private final EventLogService eventLogService;
 
@@ -53,6 +59,14 @@ public class SyncMLMessageService {
         try {
             SyncMLMessage request = xmlUtil.parse(xmlRequest);
             SyncMLMessage response = handleMessage(request);
+
+            // 응답 직렬화 직전: 단말 maxMsgSize 기반 Large Object 청킹
+            String vin = extractVin(request.getSyncHdr());
+            Long maxMsgSize = deviceRepository.findById(vin)
+                    .map(Device::getMaxMsgSize)
+                    .orElse(null);
+            messageChunker.chunkIfNeeded(response, maxMsgSize);
+
             return xmlUtil.toXml(response);
         } catch (Exception e) {
             log.error("Failed to process SyncML message", e);
@@ -120,6 +134,15 @@ public class SyncMLMessageService {
         if (request.getSyncBody() != null && request.getSyncBody().getResults() != null) {
             for (Result result : request.getSyncBody().getResults()) {
                 handleResults(result, session, vin);
+            }
+        }
+
+        // DevInfo 사전 교환 - 클라이언트가 첫 메시지에 ./DevInfo/* Replace 로 동봉한 경우 (Pattern A: client-push)
+        if (request.getSyncBody() != null && request.getSyncBody().getCommands() != null) {
+            for (Command cmd : request.getSyncBody().getCommands()) {
+                if (cmd.getType() == Command.CommandType.REPLACE) {
+                    handleDevInfoReplace(cmd, vin, reqHdr, responseStatuses, session);
+                }
             }
         }
 
@@ -198,12 +221,14 @@ public class SyncMLMessageService {
                 }
             } else {
                 // 실패
+                JobStatus failedAt = job.getStatus();
                 job.setStatus(JobStatus.FAIL);
                 job.setErrorMessage("Command failed with status: " + statusCode);
                 jobRepository.save(job);
                 sessionService.failSession(session.getSessionId(), "Command failed");
+                chunkReassemblyService.clearSession(session.getSessionId());
 
-                String failType = job.getStatus() == JobStatus.DOWNLOADING ? "DOWNLOAD_FAILED" : "INSTALL_FAILED";
+                String failType = failedAt == JobStatus.DOWNLOADING ? "DOWNLOAD_FAILED" : "INSTALL_FAILED";
                 eventLogService.log(vin, job.getJobId(), session.getSessionId(), failType,
                         "Failed with status: " + statusCode);
             }
@@ -212,23 +237,108 @@ public class SyncMLMessageService {
 
     /**
      * Results 처리 (Get 응답)
+     * - MoreData 청킹 reassembly 적용
+     * - ./DevInfo/* 응답이면 Device 갱신 (Pattern B: server-pull DevInfo)
+     */
     private void handleResults(Result result, SyncSession session, String vin) {
-        if (result.getItems() != null) {
-            for (Result.Item item : result.getItems()) {
-                String uri = item.getSourceUri();
-                String data = item.getData();
-                log.info("Received result for {}: {} = {}", vin, uri, data);
+        if (result.getItems() == null) return;
 
-                // 버전 정보 업데이트
-                if (uri != null && uri.contains("SwV")) {
-                    deviceService.getDevice(vin).ifPresent(device -> {
-                        device.setCurrentVersion(data);
-                        // deviceService.save(device); // 필요 시
-                    });
-                }
+        boolean stepShouldAdvance = false;
+        for (Result.Item item : result.getItems()) {
+            String uri = item.getSourceUri();
+            // 청크 reassembly: MoreData 가 false 인 마지막 청크에서만 완전한 데이터를 얻음
+            Optional<String> assembled =
+                    chunkReassemblyService.accept(session.getSessionId(), result.getCmdId(), item);
+            if (assembled.isEmpty()) {
+                // 아직 청크가 더 와야 함
+                continue;
             }
+            String data = assembled.get();
+            log.info("Received result for {}: {} = {} ({} bytes)",
+                    vin, uri, abbreviate(data), data == null ? 0 : data.length());
+
+            if (uri == null) continue;
+
+            if (DevInfoNode.isDevInfoUri(uri)) {
+                applyDevInfoNode(vin, uri, data);
+            } else if (uri.contains("SwV")) {
+                deviceService.getDevice(vin).ifPresent(device -> {
+                    device.setCurrentVersion(data);
+                    deviceRepository.save(device);
+                });
+            }
+            stepShouldAdvance = true;
         }
-        sessionService.advanceStep(session.getSessionId());
+        if (stepShouldAdvance) {
+            sessionService.advanceStep(session.getSessionId());
+        }
+    }
+
+    /**
+     * Pattern A: Client-Push DevInfo - Pkg #1 에 Replace ./DevInfo/* 형태로 들어온 트리.
+     * 각 ./DevInfo/* Item 을 Device 엔티티에 매핑하고, Status 200 을 응답에 추가한다.
+     */
+    private void handleDevInfoReplace(Command cmd, String vin, SyncHdr reqHdr,
+                                       List<Status> responseStatuses, SyncSession session) {
+        if (cmd.getItems() == null) return;
+        boolean any = false;
+        for (Command.Item item : cmd.getItems()) {
+            String uri = item.getTargetUri();
+            if (!DevInfoNode.isDevInfoUri(uri)) continue;
+            applyDevInfoNode(vin, uri, item.getData());
+            any = true;
+        }
+        if (any) {
+            responseStatuses.add(Status.builder()
+                    .cmdId(sessionService.getNextCmdId(session.getSessionId()))
+                    .msgRef(reqHdr.getMsgId())
+                    .cmdRef(cmd.getCmdId())
+                    .cmd("Replace")
+                    .data(STATUS_OK)
+                    .build());
+            log.info("DevInfo (client-push) applied for VIN {}", vin);
+        }
+    }
+
+    /**
+     * ./DevInfo/* LocURI -> Device 컬럼 매핑
+     * 표준 노드: Man, Mod, DmV, Lang, DevId, SwV, Ext/MaxMsgSize, Ext/MaxObjSize, Ext/SupportLargeObj
+     */
+    private void applyDevInfoNode(String locUri, String value, Device device) {
+        if (value == null) return;
+        DevInfoNode.fromLocUri(locUri).ifPresentOrElse(node -> {
+            switch (node) {
+                case MANUFACTURER -> device.setManufacturer(value);
+                case MODEL -> device.setModel(value);
+                case DM_CLIENT_VERSION -> device.setDmClientVersion(value);
+                case LANGUAGE -> device.setLang(value);
+                case DEV_ID -> device.setDevId(value);
+                case SOFTWARE_VERSION -> device.setCurrentVersion(value);
+                case MAX_MSG_SIZE -> device.setMaxMsgSize(parseLongSafe(value));
+                case MAX_OBJ_SIZE -> {
+                    Long v = parseLongSafe(value);
+                    device.setMaxObjSize(v);
+                    if (v != null && v > 0) device.setSupportLargeObj(true);
+                }
+                case SUPPORT_LARGE_OBJECT -> device.setSupportLargeObj(Boolean.parseBoolean(value));
+            }
+        }, () -> log.debug("Unhandled DevInfo node: {} = {}", locUri, value));
+    }
+
+    private void applyDevInfoNode(String vin, String locUri, String value) {
+        deviceRepository.findById(vin).ifPresent(d -> {
+            applyDevInfoNode(locUri, value, d);
+            deviceRepository.save(d);
+        });
+    }
+
+    private Long parseLongSafe(String v) {
+        try { return Long.parseLong(v.trim()); } catch (Exception e) { return null; }
+    }
+
+    private String abbreviate(String s) {
+        if (s == null) return null;
+        return s.length() <= 80 ? s : s.substring(0, 80) + "...";
     }
 
     /**
@@ -254,7 +364,7 @@ public class SyncMLMessageService {
         if (session.getCurrentJobId() == null) {
             if (step == 1) {
                 // Step 2: 버전 확인 요청
-                commands.add(createGetCommand(session, "./DevInfo/SwV"));
+                commands.add(createGetCommand(session, DevInfoNode.SOFTWARE_VERSION.locUri()));
                 sessionService.advanceStep(session.getSessionId());
             }
             // 작업 없으면 Final로 종료 (handleMessage에서 처리)
@@ -270,7 +380,15 @@ public class SyncMLMessageService {
         switch (step) {
             case 1 -> {
                 // Step 2: Get VersionInfo (인증 후 첫 응답)
-                commands.add(createGetCommand(session, "./DevInfo/SwV"));
+                // Pattern B (server-pull): 단말이 ./DevInfo 를 아직 알려주지 않았다면 같이 요청
+                Device device = deviceRepository.findById(vin).orElse(null);
+                if (device == null || device.getMaxMsgSize() == null) {
+                    commands.add(createGetCommand(session, DevInfoNode.MAX_MSG_SIZE.locUri()));
+                    commands.add(createGetCommand(session, DevInfoNode.MAX_OBJ_SIZE.locUri()));
+                    commands.add(createGetCommand(session, DevInfoNode.MANUFACTURER.locUri()));
+                    commands.add(createGetCommand(session, DevInfoNode.DM_CLIENT_VERSION.locUri()));
+                }
+                commands.add(createGetCommand(session, DevInfoNode.SOFTWARE_VERSION.locUri()));
                 sessionService.advanceStep(session.getSessionId());
             }
             case 2 -> {
@@ -279,9 +397,9 @@ public class SyncMLMessageService {
             case 3 -> {
                 // Step 4: Replace PkgURL (다운로드 URL 전달)
                 if (job.getPkgUrl() != null) {
-                    commands.add(createReplaceCommand(session, "./FUMO/PkgURL", job.getPkgUrl()));
+                    commands.add(createReplaceCommand(session, SyncMLLocUri.Fumo.PKG_URL, job.getPkgUrl()));
                     // 다운로드 시작 표시를 위해 Exec Download도 같이
-                    commands.add(createExecCommand(session, "./FUMO/Download"));
+                    commands.add(createExecCommand(session, SyncMLLocUri.Fumo.DOWNLOAD));
                     job.setStatus(JobStatus.DOWNLOADING);
                     jobRepository.save(job);
                     sessionService.advanceStep(session.getSessionId());
@@ -294,7 +412,7 @@ public class SyncMLMessageService {
             }
             case 5 -> {
                 // Step 6: Exec Install (다운로드 성공 후 설치 명령)
-                commands.add(createExecCommand(session, "./FUMO/Install"));
+                commands.add(createExecCommand(session, SyncMLLocUri.Fumo.INSTALL));
                 job.setStatus(JobStatus.INSTALLING);
                 jobRepository.save(job);
                 sessionService.advanceStep(session.getSessionId());
@@ -309,6 +427,7 @@ public class SyncMLMessageService {
                 job.setStatus(JobStatus.SUCCESS);
                 jobRepository.save(job);
                 sessionService.completeSession(session.getSessionId());
+                chunkReassemblyService.clearSession(session.getSessionId());
                 eventLogService.log(vin, job.getJobId(), session.getSessionId(),
                         "JOB_COMPLETE", "Job completed successfully");
             }

@@ -37,6 +37,9 @@ public class Result {
         private String format;    // 데이터 포맷
         private String type;      // MIME 타입
         private String data;      // 실제 데이터
+        /** SyncML <MoreData/> - 추가 청크가 뒤에 더 온다는 표시 */
+        @Builder.Default
+        private boolean moreData = false;
     }
 }
 

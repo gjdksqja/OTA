@@ -33,6 +33,37 @@ public class Device {
     @Builder.Default
     private DeviceStatus deviceStatus = DeviceStatus.IDLE;
 
+    // ===== DevInfo 사전 교환으로 채워지는 필드 (./DevInfo/*) =====
+
+    /** ./DevInfo/Ext/MaxMsgSize - 단말이 1회 수신 가능한 최대 SyncML 메시지 byte 크기 */
+    @Column(name = "max_msg_size")
+    private Long maxMsgSize;
+
+    /** ./DevInfo/Ext/MaxObjSize - 단말이 처리 가능한 최대 단일 오브젝트 byte 크기 */
+    @Column(name = "max_obj_size")
+    private Long maxObjSize;
+
+    /** Large Object (MoreData 청킹) 지원 여부 */
+    @Column(name = "support_large_obj")
+    @Builder.Default
+    private Boolean supportLargeObj = Boolean.FALSE;
+
+    /** ./DevInfo/Man - 제조사 */
+    @Column(length = 100)
+    private String manufacturer;
+
+    /** ./DevInfo/DmV - DM Client 버전 */
+    @Column(name = "dm_client_version", length = 50)
+    private String dmClientVersion;
+
+    /** ./DevInfo/Lang - 단말 언어 */
+    @Column(length = 20)
+    private String lang;
+
+    /** ./DevInfo/DevId - 단말 자기 식별자 (보통 IMEI/UUID) */
+    @Column(name = "dev_id", length = 100)
+    private String devId;
+
     @Column(name = "created_at")
     private LocalDateTime createdAt;
 

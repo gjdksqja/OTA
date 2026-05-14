@@ -67,8 +67,9 @@ docker-compose up -d
 - [x] Phase 1: 아키텍처 문서화
 - [x] Phase 2: Java 백엔드 + DB 큐 (구조 완성, Java 설치 후 빌드 필요)
 - [ ] **Phase 2.5: SyncML 표준 정합성 갭 메우기** 🔴 진행 예정
-  - DevInfo 사전 교환, 파일 사이징, MoreData 청킹, PKI 패키지 검증
+  - DevInfo 사전 교환, 파일 사이징, MoreData 청킹
   - Status 202 분리, Generic Alert 1226, WBXML 인코딩
+  - PKI 패키지 검증
   - 상세: [TODO.md 표준 준수 우선순위](./docs/TODO.md#-우선순위-표준-준수-syncml-12-정합성)
 - [ ] Phase 3: Vue 3 대시보드
 - [ ] Phase 4: RabbitMQ 확장

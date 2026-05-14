@@ -29,6 +29,28 @@ public class UpdateJob {
     @Column(name = "pkg_url", length = 500)
     private String pkgUrl;
 
+    // ===== 패키지 메타 (파일 사이징 + 무결성, 추후 PKI 검증과 연계) =====
+
+    /** 패키지 파일 크기 (byte). MoreData 청킹 / 진행률 계산에 사용 */
+    @Column(name = "pkg_size")
+    private Long pkgSize;
+
+    /** 패키지 SHA-256 hex (./FUMO/PackageHash 로 발행) */
+    @Column(name = "pkg_sha256", length = 128)
+    private String pkgSha256;
+
+    /** 패키지 서명 (Base64). PKI 검증 흐름에서 사용 (추후 구현) */
+    @Column(name = "pkg_signature", columnDefinition = "TEXT")
+    private String pkgSignature;
+
+    /** 서명 알고리즘 (예: SHA256withRSA) */
+    @Column(name = "signature_algorithm", length = 50)
+    private String signatureAlgorithm;
+
+    /** 서명 인증서 체인 (PEM, 추후 PKI 검증) */
+    @Column(name = "signing_cert_chain", columnDefinition = "TEXT")
+    private String signingCertChain;
+
     @Enumerated(EnumType.STRING)
     @Column(length = 20)
     @Builder.Default

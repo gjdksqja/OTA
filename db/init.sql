@@ -10,6 +10,14 @@ CREATE TABLE device (
     target_version VARCHAR(50),
     last_seen_at TIMESTAMP DEFAULT NOW(),
     device_status VARCHAR(20) DEFAULT 'IDLE',  -- IDLE, UPDATING, FAILED
+    -- DevInfo 사전 교환으로 채워지는 컬럼 (./DevInfo/*)
+    max_msg_size BIGINT,                       -- ./DevInfo/Ext/MaxMsgSize
+    max_obj_size BIGINT,                       -- ./DevInfo/Ext/MaxObjSize
+    support_large_obj BOOLEAN DEFAULT FALSE,   -- MoreData 청킹 지원 여부
+    manufacturer VARCHAR(100),                 -- ./DevInfo/Man
+    dm_client_version VARCHAR(50),             -- ./DevInfo/DmV
+    lang VARCHAR(20),                          -- ./DevInfo/Lang
+    dev_id VARCHAR(100),                       -- ./DevInfo/DevId
     created_at TIMESTAMP DEFAULT NOW()
 );
 
@@ -20,6 +28,12 @@ CREATE TABLE update_job (
     command_type VARCHAR(50) NOT NULL,  -- FUMO_UPDATE, SCOMO_INSTALL 등
     payload_version VARCHAR(50),
     pkg_url VARCHAR(500),
+    -- 패키지 메타 (사이징 + 무결성, 추후 PKI 검증과 연계)
+    pkg_size BIGINT,
+    pkg_sha256 VARCHAR(128),
+    pkg_signature TEXT,
+    signature_algorithm VARCHAR(50),
+    signing_cert_chain TEXT,
     status VARCHAR(20) DEFAULT 'QUEUED',  -- QUEUED, ASSIGNED, DOWNLOADING, INSTALLING, SUCCESS, FAIL
     retry_count INT DEFAULT 0,
     error_message TEXT,

@@ -167,6 +167,7 @@ public class SyncMLXmlUtil {
                     .sourceUri(getLocUri(itemElem, "Source"))
                     .targetUri(getLocUri(itemElem, "Target"))
                     .data(getTextContent(itemElem, "Data"))
+                    .moreData(getFirstChildElement(itemElem, "MoreData") != null)
                     .build());
         }
         builder.items(items);
@@ -185,6 +186,7 @@ public class SyncMLXmlUtil {
                     .sourceUri(getLocUri(itemElem, "Source"))
                     .targetUri(getLocUri(itemElem, "Target"))
                     .data(getTextContent(itemElem, "Data"))
+                    .moreData(getFirstChildElement(itemElem, "MoreData") != null)
                     .build());
         }
 
@@ -359,6 +361,10 @@ public class SyncMLXmlUtil {
                 }
                 if (item.getData() != null) {
                     appendTextElement(doc, itemElem, "Data", item.getData());
+                }
+                // SyncML Large Object 청킹: 이 Item 뒤에 추가 청크가 더 온다는 표시
+                if (item.isMoreData()) {
+                    itemElem.appendChild(doc.createElement("MoreData"));
                 }
 
                 elem.appendChild(itemElem);

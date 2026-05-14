@@ -2,54 +2,147 @@
 
 ---
 
+## 도입 검토 문서
+
+- [ADOPTION_REVIEW.md](./ADOPTION_REVIEW.md) — 하네스 도입 / 오케스트라 범위 / 테스트 자동 개선 / 보고 체계 검토
+- 결론 요약: **테스트 자동 개선 → 가벼운 하네스 MVP → Markdown/JSON 보고 체계 → Docker Compose 오케스트라 확장** 순서 권장
+- 도입 여부는 위 문서를 보고 결정. 아직 TODO 본 작업으로 확정하지 않음.
+
+---
+
+## 2026-05-14 작업 완료 내용
+
+### DevInfo/FUMO 상수화 및 패키지 정책 정리
+
+| 항목 | 결과 |
+|------|------|
+| DevInfo 표준 노드 Enum화 | ✅ `DevInfoNode` 추가 |
+| FUMO LocURI constants 분리 | ✅ `SyncMLLocUri` 추가 |
+| `./DevInfo/SwV` 현재 버전 매핑 | ✅ `Device.currentVersion` 갱신 |
+| 다운로드/설치 실패 로그 타입 판정 | ✅ 상태 변경 전 단계 기준으로 수정 |
+| 업데이트 파일 정책 문서화 | ✅ 단일 패키지 아티팩트 + Manifest 확장 정책 |
+
+### 정책 결정
+
+- 현재 구현은 **작업 1개 : `PkgURL` 1개** 기준이다.
+- `PkgURL` 이 ZIP/TAR 같은 압축 파일이면 **압축 해제와 내부 파일 적용 순서는 단말/시뮬레이터 책임**으로 둔다.
+- 여러 파일을 서버가 명시적으로 관리해야 하면, 다음 단계에서는 `PkgURL` 을 manifest URL 로 보고 manifest 안에 파일 목록/순서/sha256/대상 ECU 를 넣는 방식을 우선 검토한다.
+- 파일별 상태까지 운영툴에서 보여줘야 할 때만 `update_package` / `update_package_artifact` 테이블 분리를 검토한다.
+
+### 다음 구현 후보
+
+- [ ] `SyncMLStatusCode`, `SyncMLAlertCode`, `SyncMLCommandName` constants 추가
+- [ ] `JobController.JobCreateRequest` 에 `pkgSize`, `pkgSha256` 입력 또는 패키지 업로드 API 추가
+- [ ] `SyncMLMessageService` Step 4 에 `PackageSize`, `PackageHash` 동봉 (PKI 본작업 전 hash-only 가능)
+- [ ] Manifest 방식 샘플 JSON + 시뮬레이터 manifest 처리 실험
+
+---
+
+## 2026-05-13 작업 완료 내용
+
+### SyncML 1.2 표준 정합성 1차 (DevInfo · 사이징 · MoreData)
+
+| 항목 | 결과 |
+|------|------|
+| #1 DevInfo 사전 교환 (Pattern A 수신 + Pattern B 발행) | ✅ |
+| #2 Device.maxMsgSize/MaxObjSize + UpdateJob 패키지 메타 컬럼 | ✅ |
+| #3 `<MoreData/>` 파싱·생성 + 송신 측 청킹 + 수신 측 reassembly | ✅ |
+| TODO 순서 조정: PKI(#4) 를 WBXML(#7) 뒤로 이동 | ✅ |
+
+### 신규/변경 파일
+- `domain/Device.java`, `domain/UpdateJob.java`, `db/init.sql` — 컬럼 확장
+- `syncml/dto/Command.java`, `syncml/dto/Result.java` — `moreData` 필드
+- `syncml/util/SyncMLXmlUtil.java` — `<MoreData/>` 파싱·생성
+- `syncml/util/MessageChunker.java` (신규) — 송신 측 청킹
+- `syncml/service/ChunkReassemblyService.java` (신규) — 수신 측 reassembly
+- `syncml/service/SyncMLMessageService.java` — DevInfo 양방향 처리, 청킹/reassembly 통합, `Device` 갱신
+
+### 다음 차례
+- #5 Status 200/202 분리 + Generic Alert 1226 (단독 작업, 가벼움)
+- #6 RabbitMQ Phase 2
+- #7 WBXML 인코딩 추상화
+- #4 PKI 패키지 검증 (WBXML 후)
+
+### 검토 후 도입 후보
+- [ ] 테스트 자동 개선: `MessageChunkerTest`, `ChunkReassemblyServiceTest`, `SyncMLXmlUtil` MoreData round-trip 테스트
+- [ ] 하네스 MVP: `normal-update` 시나리오 자동 실행
+- [ ] 보고 체계: `build/reports/syncml-harness/report.md`, `summary.json`
+- [ ] 오케스트라 확장: Docker Compose smoke test (RabbitMQ Phase 2 이후)
+
+---
+
 ## 🔴 우선순위 표준 준수 (SyncML 1.2 정합성)
 
 > 2026-04-27 갭 분석 추가. 모두 **아직 작업 안됨**. 위에서부터 순서대로 작업 권장 (의존 관계 있음).
 > 상세 설명은 [ARCHITECTURE.md 섹션 5.0.3 ~ 5.11](./ARCHITECTURE.md#503-devinfo-사전-교환-표준-정합성) 참조.
 
+### 인증·식별 구현 매트릭스 (헷갈림 방지)
+
+| 영역 | 구현 상태 | 비고 |
+|------|-----------|------|
+| Cred Basic 인증 (`syncml:auth-basic`) | ✅ 구현됨 | `SyncMLAuthService` |
+| Cred MD5 + Nonce 인증 (`syncml:auth-md5`) | ✅ 구현됨 | NextNonce 재발급 포함 |
+| Cred HMAC 인증 (`syncml:auth-hmac`) | ❌ 미구현 | 우선순위 낮음 |
+| 인증 실패 카운터 / 잠금 | ✅ 구현됨 | `DeviceCredential.failCount`, 5회 잠금 |
+| SessionID 연속성 | ✅ 구현됨 | `SyncSession` |
+| **DevInfo 트리 사전 교환** | ✅ 구현됨 | `DevInfoNode`, `SyncMLMessageService` |
+
 | # | 항목 | 의존 관계 | 상태 |
 |---|------|-----------|------|
-| 1 | **DevInfo 사전 교환** (`./DevInfo` 트리 표준 교환) | (없음) | 🔴 아직 작업 안됨 |
-| 2 | **파일 사이징 + 패키지 메타** (Device.maxMsgSize, UpdateJob.pkgSize/sha256) | #1 | 🔴 아직 작업 안됨 |
-| 3 | **MoreData 청킹** (`<MoreData/>` 파싱·생성·reassembly) | #1, #2 | 🔴 아직 작업 안됨 |
-| 4 | **PKI 패키지 검증 흐름** (Replace에 Hash/Sig 동봉, 업로드 시 검증) | #2 | 🔴 아직 작업 안됨 |
+| 1 | **DevInfo 사전 교환** (`./DevInfo` 트리 표준 교환) | (없음) | ✅ 완료 (2026-05-13) |
+| 2 | **파일 사이징 + 패키지 메타** (Device.maxMsgSize, UpdateJob.pkgSize/sha256) | #1 | ✅ 완료 (2026-05-13) |
+| 3 | **MoreData 청킹** (`<MoreData/>` 파싱·생성·reassembly) | #1, #2 | ✅ 완료 (2026-05-13) |
 | 5 | **Status 202 분리** + **Generic Alert 1226 핸들러** | (없음, 단독 가능) | 🔴 아직 작업 안됨 |
 | 6 | **RabbitMQ Phase 2 연동** (기존 TODO #6) | (없음) | 🟡 계획됨 |
 | 7 | **WBXML 인코딩** (Content-Type 협상, codec 추가) | (없음, 큰 작업) | 🔴 아직 작업 안됨 |
+| 4 | **PKI 패키지 검증 흐름** (Replace에 Hash/Sig 동봉, 업로드 시 검증) | #2, #7 | 🔴 아직 작업 안됨 (WBXML 뒤로 이동) |
+
+> ⚠️ **순서 변경 (2026-05-13)**: PKI 검증(#4)을 WBXML(#7) **뒤로** 이동.
+> 사유: WBXML 인코딩이 끝나야 패키지 메타(Hash/Sig) 가 양쪽 인코딩(XML/WBXML) 모두에서 일관되게 발행/검증되므로,
+> WBXML 추상화가 먼저 들어가는 게 PKI 작업의 재작업 비용을 줄인다.
 
 ### 작업 순서 권장
 
 ```
-[1] DevInfo 사전 교환 ──────► [2] 파일 사이징/패키지 메타 ──┬─► [3] MoreData 청킹
-                                                          │
-                                                          └─► [4] PKI 패키지 검증
-
-[5] Status 202 + Alert 1226   (위 흐름과 독립적, 언제든 가능)
-[6] RabbitMQ Phase 2          (위 흐름과 독립적)
-[7] WBXML                     (큰 작업, 1~4 끝나고)
+[1] DevInfo 사전 교환 ✅ ──► [2] 파일 사이징/패키지 메타 ✅ ──► [3] MoreData 청킹 ✅
+                                                                       │
+[5] Status 202 + Alert 1226   (위 흐름과 독립적, 언제든 가능)            │
+[6] RabbitMQ Phase 2          (위 흐름과 독립적)                        │
+[7] WBXML                     (큰 작업, 인코딩 추상화)  ◄────────────────┘
+                                       │
+                                       ▼
+[4] PKI 패키지 검증 흐름      (WBXML 뒤. 양쪽 인코딩 모두에서 Hash/Sig 일관 발행)
 ```
 
 ### 각 항목 상세
 
-#### 1. DevInfo 사전 교환 🔴 아직 작업 안됨
-- **파일**: `SyncMLMessageService.handleMessage`, `SyncMLXmlUtil.parseSyncBody`, `Device` 엔티티
-- **컬럼 추가**: `device.max_msg_size`, `max_obj_size`, `support_large_obj`, `manufacturer`, `dm_client_version`
-- **로직**: 인증 성공 직후 첫 응답에서 `Get ./DevInfo` 발행 → Results 받으면 Device 갱신
-- **참조**: [ARCHITECTURE.md 5.0.3](./ARCHITECTURE.md#503-devinfo-사전-교환-표준-정합성)
+#### 1. DevInfo 사전 교환 ✅ 완료 (2026-05-13)
+- **선행 확인**: Cred 인증(Nonce/MD5) 로직은 ✅ **이미 구현됨** (`SyncMLAuthService`, `DeviceCredential.serverNonce`, `SyncMLMessageService:84` `updateNonce`). 이 작업은 **인증을 새로 만드는 게 아니라**, 인증이 끝난 첫 메시지(Pkg #1)에 같이 들어오는 `./DevInfo/*` 트리를 파싱·저장하는 로직을 추가하는 것이다.
+- **Cred vs DevInfo 구분**: [ARCHITECTURE.md 5.0.3 표 참조](./ARCHITECTURE.md#503-devinfo-사전-교환-표준-정합성) — Cred는 `<SyncHdr>` 안의 신원 확인, DevInfo는 `<SyncBody>` 안의 단말 스펙 통보.
+- **변경 파일**:
+  - `domain/Device.java` — `maxMsgSize`, `maxObjSize`, `supportLargeObj`, `manufacturer`, `dmClientVersion`, `lang`, `devId` 컬럼 추가
+  - `db/init.sql` — 동일 컬럼 추가
+  - `syncml/service/SyncMLMessageService.java` — `handleDevInfoReplace` (Pattern A: client-push), `handleResults` 의 `./DevInfo/*` 분기 (Pattern B: server-pull), `applyDevInfoNode` 매퍼
+  - `determineNextCommands` step 1 에서 `device.maxMsgSize == null` 이면 `Get ./DevInfo/Ext/MaxMsgSize|MaxObjSize|Man|DmV` 동봉 (Pattern B)
 
-#### 2. 파일 사이징 + 패키지 메타 🔴 아직 작업 안됨
-- **파일**: `UpdateJob` 엔티티, 패키지 업로드 API (신규)
-- **컬럼 추가**: `update_job.pkg_size`, `pkg_sha256`, `pkg_signature`, `signature_algorithm`, `signing_cert_chain`
-- **로직**: 패키지 업로드 시 sha256 계산, 사이즈 측정, 메타 저장
-- **참조**: [ARCHITECTURE.md 5.7, 5.9](./ARCHITECTURE.md#57-메시지-사이징--moredata-청킹)
+#### 2. 파일 사이징 + 패키지 메타 ✅ 완료 (2026-05-13)
+- **변경 파일**:
+  - `domain/UpdateJob.java` — `pkgSize`, `pkgSha256`, `pkgSignature`, `signatureAlgorithm`, `signingCertChain` 컬럼 추가
+  - `db/init.sql` — 동일 컬럼 추가
+- **남은 일** (PKI 작업 #4 에서 처리): 패키지 업로드 API + sha256/사이즈 자동 계산 + 서버가 Replace `./FUMO/PackageHash` 동봉
 
-#### 3. MoreData 청킹 🔴 아직 작업 안됨
-- **파일**: `Command.Item`, `Result.Item` DTO + `SyncMLXmlUtil` + `SyncMLMessageService` + `SyncSession`
-- **DTO 변경**: `boolean moreData` 필드 추가
-- **로직**: 응답 직렬화 직전 byte 측정 → device.maxMsgSize 초과 시 Item 분할 + `<MoreData/>` 부착. 수신 시 같은 CmdID로 reassembly buffer에 누적.
-- **참조**: [ARCHITECTURE.md 5.7](./ARCHITECTURE.md#57-메시지-사이징--moredata-청킹)
+#### 3. MoreData 청킹 ✅ 완료 (2026-05-13)
+- **변경 파일**:
+  - `syncml/dto/Command.java`, `syncml/dto/Result.java` — `boolean moreData` 필드 추가
+  - `syncml/util/SyncMLXmlUtil.java` — `<MoreData/>` 파싱(`getFirstChildElement(... "MoreData") != null`) 및 생성(`appendChild(doc.createElement("MoreData"))`)
+  - `syncml/util/MessageChunker.java` (신규) — `chunkIfNeeded(message, device.maxMsgSize)` 로 송신 측 Item 분할 (마진 512 byte)
+  - `syncml/service/ChunkReassemblyService.java` (신규) — sessionId+cmdId 기준 In-Memory reassembly buffer
+  - `syncml/service/SyncMLMessageService.java` — `processMessage` 응답 직렬화 직전 `messageChunker.chunkIfNeeded(...)` 호출, `handleResults` 에서 `chunkReassemblyService.accept(...)` 로 누적, 세션 완료/실패 시 `clearSession`
 
-#### 4. PKI 패키지 검증 흐름 🔴 아직 작업 안됨
+#### 4. PKI 패키지 검증 흐름 🔴 아직 작업 안됨 (WBXML 뒤로 이동, 2026-05-13)
+- **순서 변경 사유**: 패키지 메타(Hash/Sig)가 XML/WBXML **양쪽 인코딩에서 동일하게 발행·검증**되어야 하므로,
+  WBXML 인코딩 추상화(#7)가 먼저 들어간 뒤 그 위에서 PKI를 구현하는 것이 재작업 비용을 줄임.
+  의존: #2 ✅ + #7 🔴
 - **파일**: `SyncMLMessageService.determineNextCommands case 3`, 신규 `PackageController`, 신규 `PkiService`
 - **로직**:
   - 업로드 시: 인증서 체인 검증 + 서명 검증 (실패 거부)

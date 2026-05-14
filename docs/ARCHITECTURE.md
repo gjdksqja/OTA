@@ -97,16 +97,19 @@ CREATE TABLE device (
     current_version VARCHAR(50),
     target_version VARCHAR(50),
     last_seen_at TIMESTAMP,
-    device_status VARCHAR(20)  -- IDLE, UPDATING, FAILED
-    -- ❌ 미구현: max_msg_size INT       (DevInfo 교환 후 채움)
-    -- ❌ 미구현: max_obj_size INT       (DevInfo 교환 후 채움)
-    -- ❌ 미구현: support_large_obj BOOLEAN  (MoreData 지원 여부)
-    -- ❌ 미구현: manufacturer VARCHAR(50)
-    -- ❌ 미구현: dm_client_version VARCHAR(20)
+    device_status VARCHAR(20),  -- IDLE, UPDATING, FAILED
+    -- ✅ 2026-05-13 구현: DevInfo 사전 교환으로 채워지는 컬럼
+    max_msg_size BIGINT,            -- ./DevInfo/Ext/MaxMsgSize
+    max_obj_size BIGINT,            -- ./DevInfo/Ext/MaxObjSize
+    support_large_obj BOOLEAN,      -- MoreData 지원 여부 (MaxObjSize>0 으로 추정)
+    manufacturer VARCHAR(100),      -- ./DevInfo/Man
+    dm_client_version VARCHAR(50),  -- ./DevInfo/DmV
+    lang VARCHAR(20),               -- ./DevInfo/Lang
+    dev_id VARCHAR(100)             -- ./DevInfo/DevId
 );
 ```
 
-> 미구현 컬럼은 [5.0.3 DevInfo 사전 교환](#503-devinfo-사전-교환-표준-정합성) 과 [5.7 MoreData](#57-메시지-사이징--moredata-청킹) 도입 시 추가.
+> 위 컬럼은 [5.0.3 DevInfo 사전 교환](#503-devinfo-사전-교환-표준-정합성) 과 [5.7 MoreData](#57-메시지-사이징--moredata-청킹) 의 결과로 채워진다.
 
 ### 4.2 update_job (작업)
 
@@ -121,16 +124,17 @@ CREATE TABLE update_job (
     retry_count INT DEFAULT 0,
     error_message TEXT,
     created_at TIMESTAMP,
-    updated_at TIMESTAMP
-    -- ❌ 미구현: pkg_size BIGINT             (패키지 byte 크기)
-    -- ❌ 미구현: pkg_sha256 VARCHAR(64)      (SHA-256 hex)
-    -- ❌ 미구현: pkg_signature TEXT          (Base64 코드사이닝 서명)
-    -- ❌ 미구현: signature_algorithm VARCHAR(50)  -- RSA-PSS-SHA256, ECDSA-P256-SHA256
-    -- ❌ 미구현: signing_cert_chain TEXT     (PEM 체인)
+    updated_at TIMESTAMP,
+    -- ✅ 2026-05-13 컬럼만 구현 (PKI 검증 로직은 #4 작업 예정 - WBXML 뒤)
+    pkg_size BIGINT,                       -- 패키지 byte 크기
+    pkg_sha256 VARCHAR(128),               -- SHA-256 hex
+    pkg_signature TEXT,                    -- Base64 코드사이닝 서명
+    signature_algorithm VARCHAR(50),       -- RSA-PSS-SHA256, ECDSA-P256-SHA256
+    signing_cert_chain TEXT                -- PEM 체인
 );
 ```
 
-> 미구현 컬럼은 [5.9 PKI 검증 흐름](#59-패키지-무결성--pki-검증-흐름) 도입 시 추가.
+> 컬럼은 ✅ 추가됨. 실제 검증 흐름(업로드 시 sha256 계산, Replace `./FUMO/PackageHash` 동봉, Alert 1226 PKI 실패 핸들러)은 [5.9 PKI 검증 흐름](#59-패키지-무결성--pki-검증-흐름) 의 **WBXML 인코딩(#7) 완료 이후** 구현 예정.
 
 ### 4.3 sync_session (세션)
 
@@ -406,9 +410,37 @@ INITIALIZED ──(인증성공)──► AUTHENTICATED ──(작업시작)─�
 
 ### 5.0.3 DevInfo 사전 교환 (표준 정합성)
 
-> ❌ **미구현** — 현재는 `Source LocURI` 에서 VIN만 추출. 표준 SyncML DM은 첫 세션에서 단말 정보 트리 전체를 교환한다.
+> ✅ **구현 완료 (2026-05-13)** — Pattern A(Client-Push) 와 Pattern B(Server-Pull) 모두 처리.
+> - Pattern A: 단말이 첫 Pkg 에 `<Replace>` 로 `./DevInfo/*` 동봉 시 `SyncMLMessageService.handleDevInfoReplace` 가 파싱·저장 후 Status 200 응답
+> - Pattern B: `device.maxMsgSize == null` 이면 서버가 step 1 응답에 `Get ./DevInfo/Ext/MaxMsgSize|MaxObjSize|Man|DmV` 발행, 단말 `<Results>` 를 `handleResults` 가 수신·저장
+> - 매핑: `./DevInfo/Man → manufacturer`, `Mod → model`, `DmV → dmClientVersion`, `Lang → lang`, `DevId → devId`, `SwV → currentVersion`, `Ext/MaxMsgSize → maxMsgSize`, `Ext/MaxObjSize → maxObjSize (+ supportLargeObj=true)`
+> - 상수 관리: 표준 `./DevInfo/*` 노드는 `DevInfoNode` enum, `./FUMO/*` 경로는 `SyncMLLocUri` constants 에서 중앙 관리한다.
+
+#### DevInfo/FUMO 상수 관리 원칙
+
+| 대상 | 관리 방식 | 이유 |
+|------|-----------|------|
+| 표준 DevInfo 노드 | `DevInfoNode` enum | 서버가 의미를 알고 `Device` 컬럼에 매핑해야 하므로 오타/분기 누락 방지 |
+| FUMO LocURI | `SyncMLLocUri.Fumo` constants | `PkgURL`, `Download`, `Install`, `PackageHash` 등 명령 경로 재사용 |
+| 알 수 없는 `./DevInfo/*` 확장 | 저장하지 않고 debug 로그 | 벤더 확장은 나중에 allow-list 로 확장 가능 |
+| Status/Alert 코드 | 현재 서비스 내부 상수, 추후 `SyncMLStatusCode`/`SyncMLAlertCode` 분리 가능 | 코드 수가 늘면 중앙화 |
+
+정책: **프로토콜 문자열은 서비스 로직에 직접 쓰지 않는다.** 새 DevInfo/FUMO 노드가 필요하면 먼저 enum/constants 에 추가하고, 그다음 서비스 매핑을 작성한다.
 
 SyncML 1.2 표준은 첫 세션에서 단말이 자기 정보(`./DevInfo` 트리)를 서버에 전달해야 한다. 이게 있어야 서버가 메시지 사이즈 분할(MoreData), 언어, 모델별 분기를 할 수 있다.
+
+#### Cred(인증) vs DevInfo(사전 교환) — 헷갈리지 말 것
+
+둘은 **첫 메시지(Pkg #1)에 같이 실려서 오지만 목적이 완전히 다르다**. Cred 인증 로직은 이미 구현되어 있고(`SyncMLAuthService`, `DeviceCredential`), DevInfo는 인증 성공 후 단말 스펙을 저장하는 영역이다.
+
+| 구분 | Cred (인증) | DevInfo (사전 교환) |
+|------|-------------|---------------------|
+| 질문 | "너 등록된 차 맞아?" | "너 어떤 스펙이야?" |
+| 메시지 위치 | `<SyncHdr>` 안의 `<Cred>` | `<SyncBody>` 안의 `<Replace>`/`<Put>` 또는 서버 `<Get>` 응답의 `<Results>` |
+| 데이터 형식 | `Base64(MD5(user:pass:nonce))` 또는 Basic | `./DevInfo/*` 트리 노드 값 |
+| 검증/처리 결과 | Status 212 / 401 | `device` 테이블에 model/maxMsgSize/currentVersion 등 저장 |
+| 빈도 | 매 세션 또는 인증 필요 시 | 첫 세션 또는 단말 정보 변경 시 |
+| 코드 위치 | `SyncMLAuthService.authenticate()` | `SyncMLMessageService.handleDevInfoReplace()`, `handleResults()` |
 
 **표준 DevInfo 트리:**
 
@@ -419,31 +451,24 @@ SyncML 1.2 표준은 첫 세션에서 단말이 자기 정보(`./DevInfo` 트리
 | `./DevInfo/Mod` | 모델명 | `TEST-MODEL-A` |
 | `./DevInfo/DmV` | DM 클라이언트 버전 | `1.2` |
 | `./DevInfo/Lang` | 언어 | `ko-KR` |
+| `./DevInfo/SwV` | 현재 소프트웨어 버전 | `1.0.0` |
 | `./DevInfo/Ext/MaxMsgSize` | 한 번에 받을 수 있는 SyncML 메시지 max byte | `16384` |
 | `./DevInfo/Ext/MaxObjSize` | 한 Item의 max byte | `8192` |
 | `./DevInfo/Ext/SupportLargeObj` | LargeObject(MoreData) 지원 여부 | `true` |
 
-**교환 패턴 (둘 중 하나):**
+**교환 패턴:**
 
-```
-패턴 A: Client-Push (단말이 먼저 보냄)
-─────────────────────────────────────
-Client → Server: Alert 1201 + Put ./DevInfo + Cred
-Server → Client: Status 212 + (다음 명령)
+```text
+패턴 A: Client-Push
+Client → Server: Alert 1201 + Cred + Replace ./DevInfo/*
+Server → Client: Status 212/200 + 다음 명령
 
-패턴 B: Server-Pull (서버가 요청)
-─────────────────────────────────────
+패턴 B: Server-Pull
 Client → Server: Alert 1201 + Cred
-Server → Client: Status 212 + Get ./DevInfo
-Client → Server: Results ./DevInfo
-Server → Client: (다음 명령)
+Server → Client: Status 212 + Get ./DevInfo/*
+Client → Server: Results ./DevInfo/*
+Server → Client: 다음 명령
 ```
-
-**왜 필요한가:**
-- `MaxMsgSize` 모르면 응답 메시지가 단말 버퍼 초과 → 단말 측에서 무한 재시도
-- `MaxObjSize` 모르면 Replace에 큰 데이터 못 실음
-- `Mod`/`Man` 으로 모델별 펌웨어 다르게 보냄
-- `Lang` 으로 에러 메시지 i18n
 
 ---
 
@@ -452,135 +477,85 @@ Server → Client: (다음 명령)
 > **핵심**: "Server → Client"는 서버가 클라이언트를 찾아가는 게 아니라,
 > **클라이언트 요청에 대한 HTTP 응답으로 포함**되는 것이다.
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                      SyncML FUMO 전체 흐름                          │
-├────────────────────────────────────────────────────────────────────┤
-│                                                                    │
-│  Step 1: 차량 → 서버   "나 VIN-0002야" (Alert 1201 + DevInfo)        │
-│          └─ 세션 시작 요청 + Cred 인증 정보 포함                      │
-│                                                                    │
-│  Step 2: 서버 → 차량   "인증 OK" (Status 212) + "버전 뭐야?" (Get)    │
-│          └─ 인증 실패 시 Status 401 + Chal 반환, 세션 종료            │
-│                                                                    │
-│  Step 3: 차량 → 서버   "현재 버전 1.0.0이야" (Results ./DevInfo/SwV)  │
-│          └─ 서버가 target_version과 비교하여 업데이트 필요 여부 판단   │
-│                                                                    │
-│  Step 4: 서버 → 차량   "이 URL에서 다운받아" (Replace PkgURL)         │
-│          └─ 작업이 없으면 Status 200 + Final로 즉시 종료              │
-│          └─ ❌ 미구현: PackageSize, PackageHash, PackageSig 동봉 필요  │
-│                                                                    │
-│  Step 5: 차량 → 서버   "다운로드 완료" (Status 200)                   │
-│          └─ 실패 시 Status 500 반환, 서버가 재시도 또는 FAIL 처리      │
-│                                                                    │
-│  Step 6: 서버 → 차량   "설치 시작해" (Exec ./FUMO/Install)            │
-│          └─ 다운로드 성공 확인 후에만 설치 명령 전달                   │
-│                                                                    │
-│  Step 7: 차량 → 서버   "설치 완료" (Status 200)                       │
-│          └─ 실패 시 Status 500 + 에러 코드 반환                       │
-│                                                                    │
-│  Step 8: 서버 → 차량   "세션 종료" (Status 200 + Final)               │
-│          └─ 결과를 DB에 저장, 로그 기록, 세션 정리                     │
-│                                                                    │
-│  Step 9: 차량 대기     다음 Poll까지 휴식                             │
-│          └─ 작업 완료 시 Poll 주기를 늘림 (5초 → 60초)                │
-│                                                                    │
-└────────────────────────────────────────────────────────────────────┘
+```text
+Step 1: 차량 → 서버   Alert 1201 + Cred + DevInfo 로 세션 시작
+Step 2: 서버 → 차량   Status 212 + Get ./DevInfo/SwV 또는 필요한 DevInfo 요청
+Step 3: 차량 → 서버   Results ./DevInfo/SwV 로 현재 버전 보고
+Step 4: 서버 → 차량   Replace ./FUMO/PkgURL 로 다운로드 대상 전달
+Step 5: 차량 → 서버   Status 200/500 으로 다운로드 결과 보고
+Step 6: 서버 → 차량   Exec ./FUMO/Install 로 설치 시작 명령
+Step 7: 차량 → 서버   Status 200/500 으로 설치 결과 보고
+Step 8: 서버 → 차량   Status 200 + Final 로 세션 종료
+Step 9: 차량 대기     다음 Poll 까지 휴식
 ```
 
 ### 5.2 시퀀스 다이어그램
 
-```
-  [차량/Client]                              [서버/Server]
-       │                                          │
-       │  ① Alert 1201 + DevInfo + Cred           │
-       │ ────────────────────────────────────────►│
-       │                                          │  인증 확인
-       │  ② Status 212 + Get SwV                  │
-       │ ◄────────────────────────────────────────│
-       │                                          │
-       │  ③ Results SwV="1.0.0"                   │
-       │ ────────────────────────────────────────►│
-       │                                          │  버전 비교 → 작업 있음
-       │  ④ Replace PkgURL                        │
-       │ ◄────────────────────────────────────────│
-       │                                          │
-       │     [다운로드 중... 2~5초]                │
-       │                                          │
-       │  ⑤ Status 200 (다운로드 완료)             │
-       │ ────────────────────────────────────────►│
-       │                                          │
-       │  ⑥ Exec Install                          │
-       │ ◄────────────────────────────────────────│
-       │                                          │
-       │     [설치 중... 3~8초]                    │
-       │                                          │
-       │  ⑦ Status 200 (설치 완료)                 │
-       │ ────────────────────────────────────────►│
-       │                                          │  결과 저장
-       │  ⑧ Status 200 + Final                    │
-       │ ◄────────────────────────────────────────│
-       │                                          │
-       │     [⑨ 다음 Poll까지 대기 - 60초]         │
-       │                                          │
+```text
+[차량/Client]                              [서버/Server]
+     │ ① Alert 1201 + DevInfo + Cred           │
+     │────────────────────────────────────────►│ 인증 확인 / 작업 할당
+     │ ② Status 212 + Get SwV                  │
+     │◄────────────────────────────────────────│
+     │ ③ Results SwV="1.0.0"                   │
+     │────────────────────────────────────────►│ 버전 비교 → 작업 있음
+     │ ④ Replace PkgURL                        │
+     │◄────────────────────────────────────────│
+     │     [다운로드 중]                        │
+     │ ⑤ Status 200                            │
+     │────────────────────────────────────────►│
+     │ ⑥ Exec Install                          │
+     │◄────────────────────────────────────────│
+     │     [설치 중]                            │
+     │ ⑦ Status 200                            │
+     │────────────────────────────────────────►│ 결과 저장
+     │ ⑧ Status 200 + Final                    │
+     │◄────────────────────────────────────────│
 ```
 
 ### 5.3 작업 없음 케이스 (Short Path)
 
-```
-  [차량/Client]                              [서버/Server]
-       │                                          │
-       │  ① Alert 1201 + DevInfo + Cred           │
-       │ ────────────────────────────────────────►│
-       │                                          │  인증 OK
-       │  ② Status 212 + Get SwV                  │
-       │ ◄────────────────────────────────────────│
-       │                                          │
-       │  ③ Results SwV="2.0.0" (이미 최신)        │
-       │ ────────────────────────────────────────►│
-       │                                          │  작업 없음!
-       │  ④ Status 200 + Final (할 일 없음)       │
-       │ ◄────────────────────────────────────────│
-       │                                          │
-       │     [다음 Poll까지 대기 - 5초]            │
+```text
+Client → Server: Alert 1201 + DevInfo + Cred
+Server → Client: Status 212 + Get SwV
+Client → Server: Results SwV="2.0.0" 또는 대기 작업 없음
+Server → Client: Status 200 + Final
 ```
 
 ### 5.4 왜 Step 4와 Step 6을 분리하는가?
 
-```
-[나쁜 설계] 한 번에 다 보내기
+```text
+[나쁜 설계]
 서버: "이 URL에서 다운받고(Replace) + 설치해(Exec)"  ← 동시
-단말: 아직 다운로드도 안 했는데 설치를? 실패 확정 🤔
+단말: 아직 다운로드도 안 했는데 설치를? 실패 가능
 
-[좋은 설계] 단계 분리
+[좋은 설계]
 Step 4: "이 URL에서 다운받아" (Replace PkgURL)
-Step 5: "다운 완료함" (Status 200)  ← 다음 요청에서 보고
-Step 6: "이제 설치해" (Exec Install) ← 다운로드 성공 확인 후 명령
+Step 5: "다운 완료함" (Status 200)
+Step 6: "이제 설치해" (Exec Install)
 ```
 
-이렇게 분리하면:
-- **각 단계 결과 확인 가능** (다운로드 실패면 설치 명령 안 보냄)
-- **재시도 범위 축소** (다운로드만 재시도 vs 전체 재시도)
-- **로그 추적 용이** (어느 단계에서 실패했는지 명확)
+분리 이유:
+- 다운로드 실패면 설치 명령을 내리지 않는다.
+- 다운로드/설치 실패 지점을 로그로 구분할 수 있다.
+- 재시도 범위를 다운로드 또는 설치 단계로 좁힐 수 있다.
 
 ### 5.5 상태 전이
 
-```
+```text
 IDLE ──(작업생성)──► QUEUED ──(세션시작)──► ASSIGNED
                                               │
-                         ┌────────────────────┘
-                         │
-                         ▼
-                   DOWNLOADING ──(성공)──► INSTALLING ──(성공)──► SUCCESS
-                         │                      │
-                         └──(실패)──► FAIL ◄────┘
+                                              ▼
+                    DOWNLOADING ──(성공)──► INSTALLING ──(성공)──► SUCCESS
+                         │                       │
+                         └──(실패)──► FAIL ◄─────┘
 ```
 
 ### 5.6 Poll 주기 조정 전략
 
 | 상황 | Poll 주기 | 이유 |
 |------|-----------|------|
-| 작업 완료 직후 | 60초 | 바로 새 작업 올 확률 낮음 |
+| 작업 완료 직후 | 60초 | 바로 새 작업이 올 확률 낮음 |
 | 작업 실패 후 | 30초 | 재시도 대기 |
 | 평상시 (Idle) | 5초 | 새 작업 빠르게 감지 |
 | 업데이트 중 | 즉시 | 다음 명령 받기 위해 |
@@ -589,7 +564,13 @@ IDLE ──(작업생성)──► QUEUED ──(세션시작)──► ASSIGNED
 
 ### 5.7 메시지 사이징 & MoreData 청킹
 
-> ❌ **미구현** — 현재 [SyncMLXmlUtil](../backend/src/main/java/com/syncml/server/syncml/util/SyncMLXmlUtil.java) 은 한 HTTP 요청 = 한 SyncML 메시지로 가정. `<MoreData/>` 처리 없음.
+> ✅ **구현 완료 (2026-05-13)** —
+> - `Command.Item.moreData`, `Result.Item.moreData` 필드 추가
+> - `SyncMLXmlUtil` 에 `<MoreData/>` 파싱·생성 추가
+> - 송신 측: `MessageChunker` 가 응답 직렬화 직전 `device.maxMsgSize` 기준으로 Item 분할 (안전 마진 512 byte)
+> - 수신 측: `ChunkReassemblyService` 가 sessionId+CmdID 단위 In-Memory 버퍼로 누적, 마지막 청크에서 합쳐 처리
+> - 세션 완료/실패 시 `clearSession` 으로 버퍼 정리
+> - 한계 (포트폴리오 단순화): 한 응답 메시지 안에서의 Item 분할만 시연. 진짜 표준은 메시지 사이를 가로지르는 분할(여러 HTTP 요청에 걸친) 까지 요구하며, 그 흐름은 추후 확장.
 
 **왜 필요한가:**
 - 단말 메모리 버퍼는 보통 8~32KB. DevInfo Result, 다중 ECU 진단, 대용량 Replace 는 한 메시지에 못 담음.
@@ -629,6 +610,48 @@ Msg N+1:
 | `<MoreData/>` 파싱/생성 | [SyncMLXmlUtil](../backend/src/main/java/com/syncml/server/syncml/util/SyncMLXmlUtil.java) |
 | 세션 단위 reassembly buffer | [SyncSession](../backend/src/main/java/com/syncml/server/domain/SyncSession.java) |
 | 응답 직렬화 직전 byte 측정 → 분할 | [SyncMLMessageService](../backend/src/main/java/com/syncml/server/syncml/service/SyncMLMessageService.java) |
+
+---
+
+### 5.7.1 업데이트 패키지 파일 정책
+
+현재 구현은 `update_job.pkg_url` 기준의 **작업 1개 : 다운로드 대상 1개** 모델이다. 따라서 MVP 정책은 아래처럼 둔다.
+
+#### MVP 정책: 단일 패키지 아티팩트
+
+| 항목 | 정책 |
+|------|------|
+| 서버가 내려주는 값 | `./FUMO/PkgURL` 하나 |
+| 파일 형태 | 단일 ZIP/TAR/패키지 파일 또는 단일 manifest 파일 |
+| 서버 책임 | URL, 크기, 해시, 서명 같은 패키지 단위 메타 발행 |
+| 단말/시뮬레이터 책임 | 다운로드, 압축 해제, 내부 파일 적용 순서, 설치 결과 보고 |
+| 결과 보고 | 패키지 단위 `DOWNLOAD_COMPLETE`, `INSTALL_COMPLETE`, 실패 시 패키지 단위 FAIL |
+
+즉, `PkgURL` 이 ZIP 같은 압축 파일을 가리킨다면 **압축을 푸는 행위와 내부 파일 적용 순서는 단말 쪽 책임**으로 본다. 서버는 압축 내부 구조를 직접 알지 않아도 된다. 이게 현재 코드와 가장 잘 맞는다.
+
+#### 여러 파일이 필요한 경우의 확장 정책
+
+여러 ECU/모듈 파일을 개별로 관리해야 한다면 `pkg_url` 하나에 여러 바이너리를 직접 나열하지 말고, 다음 둘 중 하나로 확장한다.
+
+1. **Manifest 방식 권장**
+   - 서버는 `PkgURL` 로 manifest URL 하나를 내려준다.
+   - manifest 안에 파일 목록, URL, size, sha256, 적용 대상 ECU, 설치 순서를 적는다.
+   - 단말은 manifest 를 읽고 여러 파일을 순서대로 다운로드/검증/설치한다.
+
+2. **DB 정규화 방식**
+   - `update_package` / `update_package_artifact` 테이블을 추가한다.
+   - `UpdateJob` 은 `package_id` 만 참조한다.
+   - 파일별 상태까지 서버에서 추적할 수 있지만 구현량이 커진다.
+
+#### 결과 알림 정책
+
+| 패키지 모델 | 결과 알림 단위 | 설명 |
+|-------------|----------------|------|
+| 단일 ZIP/패키지 | 패키지 단위 | 현재 MVP. 내부 파일 하나가 실패해도 최종 Status 는 패키지 실패로 보고 |
+| Manifest 다중 파일 | 파일별 + 최종 요약 | 파일별 progress/fail 을 Generic Alert 1226 또는 확장 Results 로 보고, 마지막에 Job 최종 Status 저장 |
+| DB artifact 모델 | artifact 단위 DB 상태 | 운영툴에서 파일별 성공/실패를 볼 수 있음 |
+
+현재 단계에서는 **단일 패키지 아티팩트 정책을 명시하고**, 다중 파일은 manifest 방식으로 확장하는 것이 가장 자연스럽다.
 
 ---
 
@@ -680,7 +703,7 @@ WBXML (목표):
 
 ### 5.9 패키지 무결성 & PKI 검증 흐름
 
-> ❌ **미구현** — 현재 [UpdateJob](../backend/src/main/java/com/syncml/server/domain/UpdateJob.java) 은 `pkgUrl` 만 보유. 사이즈/해시/서명 컬럼 없음.
+> 🟡 **부분 구현** — `UpdateJob` 에 `pkgSize`, `pkgSha256`, `pkgSignature`, `signatureAlgorithm`, `signingCertChain` 컬럼은 추가됨. 단, 업로드 시 해시/서명 계산, Replace 응답에 `PackageHash/PackageSig` 동봉, 단말 측 PKI 검증은 WBXML 이후 구현 예정.
 
 **역할 분리 (중요):**
 
@@ -1160,6 +1183,9 @@ backend/src/main/java/com/syncml/server/
     │   ├── Status.java                    # Status 요소 + Chal
     │   ├── SyncHdr.java                   # SyncHdr 요소
     │   └── SyncMLMessage.java             # 전체 SyncML 메시지
+    ├── constant/
+    │   ├── DevInfoNode.java               # ./DevInfo/* 표준 노드 enum
+    │   └── SyncMLLocUri.java              # ./FUMO/* 등 LocURI constants
     ├── service/
     │   ├── SyncMLAuthService.java         # 인증 처리 (Basic/MD5)
     │   ├── SyncMLMessageService.java      # 메시지 처리 핵심 로직
@@ -1419,28 +1445,6 @@ private static final int SESSION_TIMEOUT_MINUTES = 5;
 | Alert/Status/Exec | publish/subscribe | 명령-응답 패턴 |
 | DB 큐 → RabbitMQ | RabbitMQ/Kafka | 내부 작업 분배 |
 
-> 핵심 개념(세션 관리, 상태 전이, 작업 큐)은 **포맷만 다르고 구조는 동일**.
-
-### 16.5 면접 예상 질문 및 답변
-
-**Q: "왜 서버가 세션 상태를 저장해야 하나요?"**
-
-> 네트워크 끊김 후 재접속 시 처음부터 다시 하면 비효율적입니다.
-> 예를 들어 500MB 다운로드 후 끊기면, 세션 상태가 없으면 다시 다운로드해야 합니다.
-> 세션에 current_step을 저장하면 이어서 진행 가능합니다.
-
-**Q: "타임아웃 5분은 어떤 기준으로 정했나요?"**
-
-> OTA 업데이트 특성상 다운로드/설치에 시간이 걸립니다.
-> 너무 짧으면 정상 작업도 만료되고, 너무 길면 비정상 세션이 리소스를 점유합니다.
-> 실무에서는 패키지 크기나 네트워크 환경에 따라 10~30분으로 조정합니다.
-
-**Q: "RabbitMQ 없이 DB 큐만으로 충분하지 않나요?"**
-
-> 단말 수가 적으면 충분합니다. 하지만 1000대 이상이면 polling 부하가 커집니다.
-> RabbitMQ는 push 방식이라 즉시 전달되고, 서버 부하도 줄어듭니다.
-> 이 프로젝트에서는 "확장 가능한 구조"를 보여주기 위해 Phase 2로 분리했습니다.
-
 ---
 
 ## 18. 문서 이력
@@ -1455,6 +1459,8 @@ private static final int SESSION_TIMEOUT_MINUTES = 5;
 | 2026-03-31 | 로그 분리 설정, TODO 문서 작성 |
 | 2026-04-27 | 표준 정합성 갭 분석 추가: 5.0.3 DevInfo 사전 교환, 5.7 MoreData, 5.8 WBXML, 5.9 PKI 패키지 검증, 5.10 Status 코드 의미 분리, 5.11 Generic Alert 1226 (모두 ❌ 미구현 표시) |
 | 2026-04-27 | 데이터 모델(4.1, 4.2)에 미구현 컬럼 명시 |
+| 2026-05-13 | 5.0.3 DevInfo 사전 교환 ✅, 5.7 MoreData 청킹 ✅, 4.1/4.2 컬럼 ✅ 구현 반영. PKI(#4) 를 WBXML(#7) 뒤로 순서 변경 |
+| 2026-05-14 | DevInfo/FUMO LocURI 상수화 정책 추가, `DevInfoNode`/`SyncMLLocUri` 도입, 업데이트 패키지 단일 아티팩트/Manifest 확장 정책 문서화 |
 
 ---
 
@@ -1467,4 +1473,3 @@ private static final int SESSION_TIMEOUT_MINUTES = 5;
 
 **작성자**: AI Copilot  
 **프로젝트**: TESTPRO - SyncML OTA System
-
